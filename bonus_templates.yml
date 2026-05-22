@@ -330,9 +330,10 @@ bonus2:
   bMagicAddSize:      "Increases magical damage against ARG monsters by V%."
 
   # Status effects (EFF = colored effect name, V = percent for resistance)
-  bAddEff:            "Inflict EFF on target V% chance"
-  bAddEff2:           "Inflict EFF on self V% chance"
-  bAddEffWhenHit:     "Inflict EFF on attacker V% chance"
+  # bAddEff value is in 1/100% units — script `, 2000` = 20% chance.
+  bAddEff:            "Has {V/100}% chance of inflicting EFF when attacking."
+  bAddEff2:           "Has {V/100}% chance of inflicting EFF on yourself when attacking."
+  bAddEffWhenHit:     "Has {V/100}% chance of inflicting EFF on the attacker when hit."
   bResEff:            "Add a V% resistance against EFF."
   bResEff_imm:        "Gain immunity to EFF."
 
@@ -416,8 +417,9 @@ bonus2:
   bAddMonsterDropChainItem: "Adds a V/100% chance to obtain ARG from the chain group when killing a monster."
 
   # AutoSpell
-  bAutoSpell:        "AutoSpell ARG Lv V on attack"
-  bAutoSpellWhenHit: "AutoSpell ARG Lv V when hit"
+  # AutoSpell rate is in 1/10% units — script `, 50` = 5% chance.
+  bAutoSpell:        "Has {V/10}% chance to cast ARG Lv V on attack."
+  bAutoSpellWhenHit: "Has {V/10}% chance to cast ARG Lv V when hit."
 
   # Zeny
   bGetZenyNum:    "Gain 1~ARG Zeny on kill"
@@ -470,8 +472,8 @@ bonus3:
   bSubRace:              "Add a V2% tolerance against ARG monsters (ARG3 trigger)."
 
   # Status effects
-  bAddEff:               "Inflict ARG on target V% chance (ARG3 trigger)."
-  bAddEffWhenHit:        "Inflict ARG on attacker V% chance (ARG3 trigger)."
+  bAddEff:               "Has {V/100}% chance of inflicting ARG when attacking (ARG3 trigger)."
+  bAddEffWhenHit:        "Has {V/100}% chance of inflicting ARG on the attacker when hit (ARG3 trigger)."
   bAddEffOnSkill:        "V% chance to inflict ARG2 on target when using ARG."
 
   # HP / SP vanish
@@ -487,8 +489,8 @@ bonus3:
   bSPDrainRateRace:      "When attacking ARG monster: V/10% chance to drain ARG2% SP."
 
   # AutoSpell
-  bAutoSpell:            "Adds a V/10% chance to cast ARG Lv ARG2 on attack."
-  bAutoSpellWhenHit:     "Adds a V/10% chance to cast ARG Lv ARG2 when hit."
+  bAutoSpell:            "Has {V/10}% chance to cast ARG Lv ARG2 on attack."
+  bAutoSpellWhenHit:     "Has {V/10}% chance to cast ARG Lv ARG2 when hit."
 
   # Drops
   bAddMonsterIdDropItem:    "Adds a V/100% chance of dropping item ARG when killing ARG2."

@@ -589,6 +589,11 @@ const DESC_ONLY_BONUSES = [
   "bDelayrate", "bSkillDelay", "bSkillCooldown",
 
   // ----- Section 3: Group-specific Bonuses (extras) -----
+  // NOTE: bAutoSpell, bAutoSpellWhenHit, bAddEff are handled by explicit
+  // translators below — they emit AddAutoSpell / AddAutoSpellWhenHit /
+  // AddEffectOnAttack calls that match custom Order entries in the user's
+  // EquipmentPropertiesOrder1.lub (entries [7]..[10]). Leaving them as
+  // desc-only here would skip the call emission.
   "bSubDefEle", "bMagicSubDefEle",
   "bWeaponSubSize", "bNoSizeFix",
   "bAddDamageClass", "bAddMagicDamageClass",
@@ -699,6 +704,236 @@ for (const [key, [addFn, subFn]] of Object.entries(SIGNED_TOOLTIP_CALLS)) {
   BONUS_TRANSLATORS[key] = (_n, a) =>
     a.length === 1 ? emitSignedTooltipCall(addFn, subFn, a[0]) : null;
 }
+
+// ----------------------------------------------------------------------------
+// Skill-targeted bonus2 translators
+//
+// rAthena `bonus2 bX, SkillName, V` → kRO `XxxxSkid(SKID.Name, V)`. The
+// EquipmentPropertiesOrder.lub entries that render these expect the SKID.X
+// constant (loaded from skillid.lub) — so we emit `SKID.<AEGIS_NAME>` as
+// the first argument. The aegis name matches rAthena's SkillName form.
+// ----------------------------------------------------------------------------
+// Emergency fallback numeric IDs for common skills, used when BOTH the
+// user's local skillid.lub AND the bundled `skillid.template.lub` failed
+// to load. Skill-ID resolution order:
+//   1. SKILL_AEGIS_TO_ID (populated by loadSkillDb from skillid.lub —
+//      either the user's local copy or the bundled template).
+//   2. BUILTIN_SKILL_IDS (this table — covers the ~100 most-used skills).
+//   3. Caller drops the call entirely (description-only fallback).
+// In practice (1) almost always wins since the template ships with every
+// build; this table only matters if the bundle itself is corrupted.
+const BUILTIN_SKILL_IDS = {
+  // Novice
+  NV_BASIC: 1, NV_FIRSTAID: 142, NV_TRICKDEAD: 143,
+  // Swordsman
+  SM_SWORD: 2, SM_TWOHAND: 3, SM_RECOVERY: 4, SM_BASH: 5,
+  SM_PROVOKE: 6, SM_MAGNUM: 7, SM_ENDURE: 8,
+  // Mage
+  MG_SRECOVERY: 9, MG_SIGHT: 10, MG_NAPALMBEAT: 11, MG_SAFETYWALL: 12,
+  MG_SOULSTRIKE: 13, MG_COLDBOLT: 14, MG_FROSTDIVER: 15, MG_STONECURSE: 16,
+  MG_FIREBALL: 17, MG_FIREWALL: 18, MG_FIREBOLT: 19, MG_LIGHTNINGBOLT: 20,
+  MG_THUNDERSTORM: 21,
+  // Acolyte
+  AL_DP: 22, AL_DEMONBANE: 23, AL_RUWACH: 24, AL_PNEUMA: 25,
+  AL_TELEPORT: 26, AL_WARP: 27, AL_HEAL: 28, AL_INCAGI: 29,
+  AL_DECAGI: 30, AL_HOLYWATER: 31, AL_CRUCIS: 32, AL_ANGELUS: 33,
+  AL_BLESSING: 34, AL_CURE: 35,
+  // Merchant
+  MC_INCCARRY: 36, MC_DISCOUNT: 37, MC_OVERCHARGE: 38, MC_PUSHCART: 39,
+  MC_IDENTIFY: 40, MC_VENDING: 41, MC_MAMMONITE: 42,
+  // Archer
+  AC_OWL: 43, AC_VULTURE: 44, AC_CONCENTRATION: 45, AC_DOUBLE: 46,
+  AC_SHOWER: 47,
+  // Thief
+  TF_DOUBLE: 48, TF_MISS: 49, TF_STEAL: 50, TF_HIDING: 51,
+  TF_POISON: 52, TF_DETOXIFY: 53,
+  // Knight
+  KN_SPEARMASTERY: 54, KN_PIERCE: 55, KN_BRANDISHSPEAR: 56,
+  KN_SPEARSTAB: 57, KN_SPEARBOOMERANG: 58, KN_TWOHANDQUICKEN: 59,
+  KN_AUTOCOUNTER: 60, KN_BOWLINGBASH: 62, KN_RIDING: 63, KN_CAVALIERMASTERY: 64,
+  // Wizard
+  WZ_FIREPILLAR: 80, WZ_SIGHTRASHER: 81, WZ_METEOR: 83, WZ_JUPITEL: 84,
+  WZ_VERMILION: 85, WZ_WATERBALL: 86, WZ_ICEWALL: 87, WZ_FROSTNOVA: 88,
+  WZ_STORMGUST: 89, WZ_EARTHSPIKE: 90, WZ_HEAVENDRIVE: 91, WZ_QUAGMIRE: 92,
+  WZ_ESTIMATION: 93,
+  // Hunter
+  HT_SKIDTRAP: 117, HT_LANDMINE: 118, HT_ANKLESNARE: 119, HT_SHOCKWAVE: 120,
+  HT_SANDMAN: 121, HT_FLASHER: 122, HT_FREEZINGTRAP: 123, HT_BLASTMINE: 124,
+  HT_CLAYMORETRAP: 125, HT_REMOVETRAP: 126, HT_TALKIEBOX: 127,
+};
+
+// Resolve a rAthena skill aegis name (MG_FIREBOLT) to the kRO numeric skill ID
+// (19). Tries the runtime-loaded skillid.lub first, then a built-in fallback
+// table of common skills. Returns null only when truly unknown — emitters
+// then drop the Lua call (never emit SKID.<NAME>, which crashes at runtime
+// when the client's SKID global isn't loaded yet).
+function resolveSkillId(skillName) {
+  const aegis = String(skillName || "").trim().replace(/^"|"$/g, "").toUpperCase();
+  if (SKILL_AEGIS_TO_ID.has(aegis)) return SKILL_AEGIS_TO_ID.get(aegis);
+  if (BUILTIN_SKILL_IDS[aegis] !== undefined) return BUILTIN_SKILL_IDS[aegis];
+  return null;
+}
+
+// kRO skill-targeted tooltip calls have several argument shapes — verified
+// against EquipmentPropertiesOrder.lub's val/sep/cond indices:
+//   shape "tsv": (target, skill, value)   — AddDamage_SKID only (3 args).
+//   shape "sv":  (skill,  value)          — most per-skill calls (2 args).
+//   shape "vs":  (value,  skill)          — addspconsumption / subspconsumption
+//                                            per-skill SP cost rate (2 args).
+// `target` = 1 (Unit.Target = enemy). Sign-aware: negative value picks Sub.
+// We never emit `SKID.<NAME>` — the SKID global table loads AFTER
+// EquipmentProperties.lub on Project 255, so the call would crash at runtime
+// ("attempt to index global 'SKID' (a nil value)"). Unknown skill → null
+// (caller falls back to a description-only line; safe, just not visible).
+function emitSkillTargetedCall(addFn, subFn, shape, skillName, valueExpr) {
+  const raw = String(skillName || "").trim().replace(/^"|"$/g, "");
+  let skillArg;
+  if (/^\d+$/.test(raw)) {
+    skillArg = raw;                              // already a numeric skill id
+  } else {
+    const skillId = resolveSkillId(raw);
+    if (skillId == null) return null;            // unknown → drop call
+    skillArg = String(skillId);
+  }
+  const num = Number(String(valueExpr).trim());
+  const useSub = Number.isFinite(num) && num < 0 && subFn;
+  const fn = useSub ? subFn : addFn;
+  const val = useSub ? String(Math.abs(num)) : String(valueExpr);
+  if (shape === "tsv") return `${fn}(1, ${skillArg}, ${val})`;
+  if (shape === "vs")  return `${fn}(${val}, ${skillArg})`;
+  // default "sv"
+  return `${fn}(${skillArg}, ${val})`;
+}
+const SKILL_TARGETED_CALLS = {
+  // bonus2 bSkillAtk, Skill, V%  — Order [6] cond=[1]=Unit.Target, sep=[2]=skill,
+  // val=[3]=value → 3-arg `AddDamage_SKID(target, skill, value)`.
+  bskillatk:              ["AddDamage_SKID",             null,                 "tsv"],
+  // bonus2 bSkillCooldown, Skill, V — Order [5] sep=[1]=skill, val=[2]=value →
+  // 2-arg `SubSkillDelay(skill, value)`.
+  bskillcooldown:         ["AddSkillDelay",              "SubSkillDelay",      "sv"],
+  // bonus2 bSkillUseSP, Skill, V — Order [4] sep=[1]=skill, val=[2]=value →
+  // 2-arg `SubSkillSP(skill, value)`.
+  bskillusesp:            ["AddSkillSP",                 "SubSkillSP",         "sv"],
+  // bonus2 bSkillUseSPrate, Skill, V — Order [3] val=[1]=value, sep=[2]=skill →
+  // 2-arg `subspconsumption(value, skill)` (lowercase function name!).
+  bskillusesprate:        ["addspconsumption",           "subspconsumption",   "vs"],
+};
+for (const [key, [addFn, subFn, shape]] of Object.entries(SKILL_TARGETED_CALLS)) {
+  BONUS_TRANSLATORS[key] = (_n, a) =>
+    a.length === 2 ? emitSkillTargetedCall(addFn, subFn, shape, a[0], a[1]) : null;
+}
+// `bonus2 bVariableCastrate, SkillName, V%` shares its name with the 1-arg
+// global form. Distinguish by arg count.
+//   - 1 arg  → SubSpellCastTime / AddSpellCastTime              (global rate)
+//   - 2 args → SubSpecificSpellCastTime / AddSpecificSpellCastTime (per-skill)
+// Per Order section [6] entry [2]: sep=[1]=skill, val=[2]=value → 2-arg shape.
+const _origVcr = BONUS_TRANSLATORS["bvariablecastrate"];
+BONUS_TRANSLATORS["bvariablecastrate"] = (n, a) => {
+  if (a.length === 2) {
+    return emitSkillTargetedCall(
+      "AddSpecificSpellCastTime", "SubSpecificSpellCastTime", "sv", a[0], a[1]
+    );
+  }
+  return _origVcr ? _origVcr(n, a) : null;
+};
+
+// ----------------------------------------------------------------------------
+// AutoSpell / on-attack effect translators
+//
+// These match custom Order entries [7]..[10] added to the user's
+// EquipmentPropertiesOrder1.lub (RDL stub functions are defined at the top
+// of that file as no-ops). The Order entries render them as:
+//   EnableSkill(id, lv)             → "Enable to use Level L of <Skill>"
+//   AddAutoSpell(id, lv, rate)      → "Random chance to auto-cast Level L of <Skill> on attack"
+//   AddAutoSpellWhenHit(id, lv, r)  → "Random chance to auto-cast Level L of <Skill> when hit"
+//   AddEffectOnAttack(id, chance%)  → "Has N% chance of inflicting <Effect> when attacking"
+//
+// Status-effect IDs use the rAthena Eff_* numeric mapping (Eff_Stun=1,
+// Eff_Freeze=2, Eff_Stone=3, ...). Same as kRO SC_* table order for the
+// common effects.
+// ----------------------------------------------------------------------------
+const EFF_IDS = {
+  EFF_STUN: 1, EFF_FREEZE: 2, EFF_STONE: 3, EFF_SLEEP: 4,
+  EFF_POISON: 5, EFF_CURSE: 6, EFF_SILENCE: 7, EFF_CONFUSION: 8,
+  EFF_BLIND: 9, EFF_BLEEDING: 10, EFF_DPOISON: 11,
+  EFF_BURNING: 127, EFF_FREEZING: 128,
+};
+function effId(name) {
+  const s = String(name || "").trim().replace(/^"|"$/g, "");
+  const key = (/^Eff_/i.test(s) ? s : "Eff_" + s).toUpperCase();
+  if (EFF_IDS[key] !== undefined) return EFF_IDS[key];
+  // Numeric input — pass through.
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  return null;
+}
+
+// Strict numeric-literal check — rejects rAthena ternaries `(a>=80)?30:10`,
+// server-only refs (Agi, BaseLevel, getrefine), and anything else the kRO
+// client can't evaluate safely at OnStartEquip time. Used by AutoSpell /
+// AddEff translators so an unparseable rate or chance falls back to
+// description-only instead of producing invalid Lua.
+function isSafeNumericLiteral(s) {
+  const t = String(s || "").trim();
+  if (!t) return false;
+  // Allow plain integers and basic numeric expressions: digits, +-*/(), space.
+  if (!/^[\d\s+\-*/().]+$/.test(t)) return false;
+  if (!/\d/.test(t)) return false;
+  return true;
+}
+
+// bonus bAddMaxWeight, V  →  AddMaxWeight(V) / SubMaxWeight(|V|)
+// Tooltip rendered by RDL custom Order entry [11] (in the bundled
+// EquipmentPropertiesOrder.template.lub stubs). Without this entry the
+// kRO client has no native "Max Weight" tooltip slot.
+BONUS_TRANSLATORS["baddmaxweight"] = (_n, a) => {
+  if (a.length !== 1) return null;
+  if (!isSafeNumericLiteral(a[0])) return null;
+  const num = Number(a[0]);
+  if (Number.isFinite(num) && num < 0) return `SubMaxWeight(${Math.abs(num)})`;
+  return `AddMaxWeight(${a[0]})`;
+};
+
+// bonus2 bDropAddRace, Race, V%  →  AddReceiveItem_Equip(V)  (only for RC_All)
+// kRO's only drop-rate tooltip call is the GLOBAL form (Order entry [23]
+// "Item Drop Rate"); there's no per-race drop-rate render function. For
+// RC_All scripts we route through that. Other races stay description-only.
+BONUS_TRANSLATORS["bdropaddrace"] = (_n, a) => {
+  if (a.length !== 2) return null;
+  if (!isSafeNumericLiteral(a[1])) return null;
+  const race = raceEnum(a[0]);
+  // RC_All resolves to 9999. For race-specific drop bonuses (Dragon,
+  // Demon, etc.) kRO has no client tooltip — fall back to desc-only.
+  if (race !== 9999) return [];
+  return `AddReceiveItem_Equip(${a[1]})`;
+};
+
+// bonus3 bAutoSpell, Skill, Lv, Rate  →  AddAutoSpell(skill_id, lv, rate)
+BONUS_TRANSLATORS["bautospell"] = (_n, a) => {
+  if (a.length !== 3) return null;
+  const skill = /^\d+$/.test(a[0]) ? parseInt(a[0], 10) : resolveSkillId(a[0]);
+  if (skill == null) return null;
+  if (!isSafeNumericLiteral(a[1]) || !isSafeNumericLiteral(a[2])) return null;
+  return `AddAutoSpell(${skill}, ${a[1]}, ${a[2]})`;
+};
+// bonus3 bAutoSpellWhenHit, Skill, Lv, Rate  →  AddAutoSpellWhenHit(...)
+BONUS_TRANSLATORS["bautospellwhenhit"] = (_n, a) => {
+  if (a.length !== 3) return null;
+  const skill = /^\d+$/.test(a[0]) ? parseInt(a[0], 10) : resolveSkillId(a[0]);
+  if (skill == null) return null;
+  if (!isSafeNumericLiteral(a[1]) || !isSafeNumericLiteral(a[2])) return null;
+  return `AddAutoSpellWhenHit(${skill}, ${a[1]}, ${a[2]})`;
+};
+// bonus2 bAddEff, EffName, Rate(1/100%)  →  AddEffectOnAttack(eff_id, chance%)
+// Rate is in 1/100% units in rAthena, so divide by 100 for the call.
+BONUS_TRANSLATORS["baddeff"] = (_n, a) => {
+  if (a.length !== 2) return null;
+  const eff = effId(a[0]);
+  if (eff == null) return null;
+  if (!isSafeNumericLiteral(a[1])) return null;
+  const num = Number(a[1]);
+  const chance = Number.isFinite(num) ? Math.round(num / 100) : a[1];
+  return `AddEffectOnAttack(${eff}, ${chance})`;
+};
 
 // Accept both `bonus bName,a,b;` and the no-arg flag form `bonus bName;`.
 const BONUS_LINE_RE = /^\s*(bonus[2345]?)\s+(\w+)\s*(?:,\s*(.+?))?\s*;\s*$/i;
@@ -841,6 +1076,9 @@ const BONUS_TRANSLATIONS = {
 // the exe). When empty, friendlySkill() falls through to the raw arg.
 const SKILL_ID_TO_AEGIS = new Map();   // 89 → "WZ_STORMGUST"
 const SKILL_AEGIS_TO_NAME = new Map(); // "WZ_STORMGUST" → "Storm Gust"
+const SKILL_AEGIS_TO_ID = new Map();   // "WZ_STORMGUST" → 89  (reverse lookup
+                                       // for kRO calls like AddDamage_SKID
+                                       // which require numeric skill IDs).
 let SKILL_DB_SOURCE = "(none)";
 
 // Bonuses whose first arg is a skill (ID or aegis name). Used to route
@@ -979,6 +1217,7 @@ function parseSkillIdLub(text) {
     if (aegis === "SKID") continue;
     const id = parseInt(m[2], 10);
     SKILL_ID_TO_AEGIS.set(id, aegis);
+    SKILL_AEGIS_TO_ID.set(aegis, id);
     count++;
   }
   return count;
@@ -1012,6 +1251,7 @@ function parseSkillInfoListLub(text) {
 async function loadSkillDb(srcLubPath) {
   SKILL_ID_TO_AEGIS.clear();
   SKILL_AEGIS_TO_NAME.clear();
+  SKILL_AEGIS_TO_ID.clear();
   SKILL_DB_SOURCE = "(none)";
 
   const exeDir = (typeof NL_PATH === "string" && NL_PATH) ? NL_PATH : "";
@@ -1044,14 +1284,28 @@ async function loadSkillDb(srcLubPath) {
     }
   }
 
-  const idHit = await findFirstReadable(idCandidates);
+  // Last-resort: bundled templates inside resources.neu. Loaded only if no
+  // local file was found — the user's own `skillid.lub` / `skillinfolist.lub`
+  // (whatever's installed with their client) always wins so they stay
+  // in sync with their patches.
+  async function fetchBundled(name) {
+    try {
+      const res = await fetch(name, { cache: "no-store" });
+      if (res.ok) return { path: "(bundled) " + name, text: await res.text() };
+    } catch {}
+    return null;
+  }
+
+  let idHit = await findFirstReadable(idCandidates);
+  if (!idHit) idHit = await fetchBundled("skillid.template.lub");
   if (!idHit) {
     log("Skill DB: not found (skill names won't be resolved in descriptions).");
     return;
   }
   const idCount = parseSkillIdLub(idHit.text);
 
-  const listHit = await findFirstReadable(listCandidates);
+  let listHit = await findFirstReadable(listCandidates);
+  if (!listHit) listHit = await fetchBundled("skillinfolist.template.lub");
   const nameCount = listHit ? parseSkillInfoListLub(listHit.text) : 0;
 
   SKILL_DB_SOURCE = idHit.path + (listHit ? " + " + listHit.path : " (names not found)");
@@ -1141,7 +1395,21 @@ function formatBonusDescription(nameLc, args) {
     };
     const localRaw = (i) => localArgs[i] !== undefined ? String(localArgs[i]) : "";
     const lastIdx = Math.max(0, localArgs.length - 1);
+    // Division placeholders: `{V/N}` and `{V<idx>/N}` divide the arg by N
+    // and emit a trimmed numeric result. Useful for bonuses whose script
+    // value is in 1/100% units (bAddEff = 2000 → "20%") or 1/10% units
+    // (bAutoSpell = 50 → "5%"). N can be any positive integer.
+    const div = (val, n) => {
+      const num = Number(val);
+      if (!Number.isFinite(num) || !n) return String(val);
+      const out = num / n;
+      return String(Number(out.toFixed(4))).replace(/\.?0+$/, "");
+    };
     return tpl
+      // Indexed division: `{V1/100}`, `{V2/10}`, etc. (1-indexed args)
+      .replace(/\{V([1-5])\/(\d+)\}/g, (_, n, d) => div(localRaw(parseInt(n, 10) - 1), parseInt(d, 10)))
+      // Last-arg division: `{V/100}`, `{V/10}`, etc.
+      .replace(/\{V\/(\d+)\}/g, (_, d) => div(localRaw(lastIdx), parseInt(d, 10)))
       // Indexed placeholders first (longer match wins under \b boundaries).
       .replace(/\bARG([1-5])\b/g, (_, n) => localFriendly(parseInt(n, 10) - 1))
       .replace(/\bV([1-5])\b/g,   (_, n) => localRaw(parseInt(n, 10) - 1))
@@ -1327,16 +1595,20 @@ const REFINE_CALL_RE_G = /\b(?:getrefine|getequiprefinerycnt|getequiprefine)\s*\
 const SERVER_ONLY_RE   = /\b(BaseLevel|JobLevel|readparam|getskilllv|getbrokenid|getmercinfo|getpartymember|countitem|rand\b)/i;
 
 // rAthena Job_X name -> kRO client job ID (used by GetPureJob / get(19)).
-// IDs match the kRO numbering, not rAthena's where they differ.
+// IDs match the kRO numbering (PCIds.lub) — NOT the rAthena server numbering
+// where Taekwon/SoulLinker/StarGladiator are 23/24/25. The kRO client uses
+// 24/25 for Gunslinger/Ninja and 4046/4047/4049 for Taekwon/StarGlad/SLinker.
 const JOB_NAME_TO_ID = {
   Job_Novice: 0, Job_Swordman: 1, Job_Swordsman: 1, Job_Mage: 2,
   Job_Archer: 3, Job_Acolyte: 4, Job_Merchant: 5, Job_Thief: 6,
   Job_Knight: 7, Job_Priest: 8, Job_Wizard: 9, Job_Blacksmith: 10,
   Job_Hunter: 11, Job_Assassin: 12, Job_Crusader: 14,
   Job_Monk: 15, Job_Sage: 16, Job_Rogue: 17, Job_Alchemist: 18,
-  Job_Bard: 19, Job_Dancer: 20, Job_Taekwon: 23,
-  Job_Soul_Linker: 24, Job_Star_Gladiator: 25, Job_SoulLinker: 24,
-  Job_StarGladiator: 25, Job_Gunslinger: 24, Job_Ninja: 25,
+  Job_Bard: 19, Job_Dancer: 20,
+  Job_Gunslinger: 24, Job_Ninja: 25,
+  // Taekwon line — kRO client IDs (NOT rAthena's 23/24/25).
+  Job_Taekwon: 4046, Job_Star_Gladiator: 4047, Job_Soul_Linker: 4049,
+  Job_StarGladiator: 4047, Job_SoulLinker: 4049,
   // Trans (4xxx) class IDs
   Job_Lord_Knight: 4008, Job_High_Priest: 4009, Job_High_Wizard: 4010,
   Job_Whitesmith: 4011, Job_Sniper: 4012, Job_Assassin_Cross: 4013,
@@ -1349,6 +1621,36 @@ const JOB_NAME_TO_ID = {
   Job_Wanderer: 4063, Job_Sura: 4065, Job_Genetic: 4068, Job_Shadow_Chaser: 4072,
   // 4th jobs / expanded
   Job_Star_Emperor: 4239, Job_Soul_Reaper: 4240,
+  Job_Dragon_Knight: 4252,
+};
+
+// Full kRO client variant IDs for each Job_X. Used by translateClassConditional
+// so `Class == Job_Soul_Linker` matches BASE Soul Linker (4049), Baby SL
+// (4227), and Soul Reaper (4240) — not just the single base ID. Also used
+// for `BaseJob == Job_Knight` to cover the whole Knight tree (Knight, Lord
+// Knight, Rune Knight, Royal Guard, Dragon Knight, baby/mounted variants, …).
+// Pulled from JobInfo/PCIds.lub on a modern Project 255-style kRO client.
+const CLASS_TREE_DESCENDANTS = {
+  // Knight branch (Swordman → Knight → Lord Knight → Rune Knight → Dragon Knight)
+  Job_Knight:         [7, 13, 4008, 4014, 4030, 4036, 4054, 4060, 4066, 4073,
+                       4080, 4081, 4082, 4083, 4088, 4089, 4090, 4091, 4092,
+                       4093, 4094, 4095, 4096, 4102, 4109, 4110, 4252, 4265, 4280],
+  Job_Crusader:       [14, 4014, 4066, 4073, 4082, 4083, 4102, 4110],
+  Job_Lord_Knight:    [4008, 4014, 4054, 4060, 4080, 4081, 4088, 4089, 4090,
+                       4091, 4092, 4093, 4094, 4095, 4096, 4109, 4252, 4265, 4280],
+  Job_Rune_Knight:    [4054, 4060, 4080, 4081, 4088, 4089, 4090, 4091, 4092,
+                       4093, 4094, 4095, 4096, 4109, 4252, 4265, 4280],
+  // Taekwon branch (Taekwon → Star Gladiator / Soul Linker → Star Emperor / Soul Reaper)
+  Job_Taekwon:        [4046, 4225],
+  Job_Star_Gladiator: [4047, 4048, 4226, 4238, 4239, 4243],
+  Job_StarGladiator:  [4047, 4048, 4226, 4238, 4239, 4243],
+  Job_Soul_Linker:    [4049, 4227, 4240],
+  Job_SoulLinker:     [4049, 4227, 4240],
+  Job_Star_Emperor:   [4239, 4243],
+  Job_Soul_Reaper:    [4240],
+  // Gunslinger / Ninja branch
+  Job_Gunslinger:     [24, 4215, 4228, 4229],         // + Rebellion, babies
+  Job_Ninja:          [25, 4211, 4212, 4222, 4223, 4224], // + Kagerou, Oboro, babies
 };
 
 // Expand `BaseClass == Job_X` to the SPECIFIC class IDs of every descendant
@@ -1376,22 +1678,36 @@ function translateClassConditional(condInner) {
     const m = /^(Class|BaseClass|BaseJob)\s*==\s*(Job_\w+)$/.exec(op);
     if (!m) return null;
     const kind = m[1];
-    const id = JOB_NAME_TO_ID[m[2]];
+    const jobName = m[2];
+    const id = JOB_NAME_TO_ID[jobName];
     if (id === undefined) return null;
+    const tree = CLASS_TREE_DESCENDANTS[jobName] || BASE_CLASS_DESCENDANTS[id] || [id];
+
+    // Stock FreyjaRO pattern (verified against EquipmentProperties.lub.preforceoverride.bak):
+    //   - GetPureJob() == <base id>     → matches the base class on a basic char
+    //   - get(19) == <client variant>   → matches each advanced/baby/trans/4th variant
+    // Combining both forms covers every character state — base chars use GetPureJob,
+    // and advanced jobs (which may not have GetPureJob == base_id semantics)
+    // are reached via get(19).
+    const checks = new Set();
     if (kind === "BaseClass") {
-      parts.push(`GetPureJob() == ${id}`);
+      // Basic class check — primarily a GetPureJob() match. Also add get(19)
+      // for each variant so the check still fires on transcendent/3rd/baby
+      // characters whose GetPureJob() might not return the base id.
+      checks.add(`GetPureJob() == ${id}`);
+      for (const d of tree) checks.add(`get(19) == ${d}`);
     } else if (kind === "BaseJob") {
-      // Need to list all specific class IDs whose base job is this Job_X.
-      // For the common bases (Swordman/Mage/.../Thief lines) we have the
-      // descendants table; for everything else fall back to the specific id.
-      const descendants = BASE_CLASS_DESCENDANTS[id] || [id];
-      const ors = descendants.map(d => `get(19) == ${d}`).join(" or ");
-      parts.push("(" + ors + ")");
+      // BaseJob branch — list every variant of this job tree explicitly via
+      // get(19). Stock kRO does this same listing style (e.g. Knight tree).
+      checks.add(`GetPureJob() == ${id}`);
+      for (const d of tree) checks.add(`get(19) == ${d}`);
     } else {
-      // `Class == Job_X` — exact current-class match. Cover both the base
-      // returned by GetPureJob and the specific id returned by get(19).
-      parts.push(`(GetPureJob() == ${id} or get(19) == ${id})`);
+      // Class == Job_X — exact current class. Use GetPureJob() for the base
+      // id and get(19) for every variant.
+      checks.add(`GetPureJob() == ${id}`);
+      for (const d of tree) checks.add(`get(19) == ${d}`);
     }
+    parts.push("(" + [...checks].join(" or ") + ")");
   }
   return parts.join(" or ");
 }
@@ -1537,19 +1853,34 @@ function friendlyStatusEffect(raw) {
 }
 
 // Best-effort friendly descriptions for non-bonus rAthena script commands.
-// The kRO equipment-tooltip Lua has no equivalent for skill grants, status
-// applications, hat effects, autobonus procs, heals, etc., so we render
-// them as `-- comment` lines so the player still sees the effect listed
-// instead of an opaque `-- TODO: …` blob in the entry.
+// The kRO equipment-tooltip Lua has no equivalent for status applications,
+// hat effects, autobonus procs, heals etc., so we render them as `--` lines
+// so the player still sees the effect listed instead of an opaque TODO.
 //
-// Returns a description string, or null if `raw` isn't a known command
-// (caller falls back to "TODO:" for visibility).
+// Return shape:
+//   - string  → single `-- description` line (most commands)
+//   - array   → multi-line emission; entries that don't start with `--` are
+//               emitted as Lua calls, comments as-is. Used for `skill X,N`
+//               which needs both an EnableSkill() call AND a description
+//               line in the OnStartEquip block.
+//   - null    → unrecognised; caller falls back to `-- TODO:`.
 function describeNonBonusCommand(raw) {
   const text = String(raw || "").trim().replace(/;\s*$/, "");
 
-  // skill SkillName, Lv;  →  "Enables Skill <FriendlyName> Lv N."
+  // skill SkillName, Lv;  → kRO `EnableSkill(<skill_id>, <lv>)` + description.
+  // Matches the stock FreyjaRO format for skill-grant cards (e.g. Marine
+  // Sphere → `EnableSkill(7, 3)`). If we can't resolve the aegis to a
+  // numeric ID we skip the call (still emit the description so the player
+  // at least sees what the card is supposed to do).
   let m = /^skill\s+([A-Za-z_]\w*)\s*,\s*(\d+)\b/i.exec(text);
-  if (m) return `Enables Skill ${friendlySkill(m[1])} Lv ${m[2]}.`;
+  if (m) {
+    const aegis = m[1];
+    const lv = m[2];
+    const skillId = resolveSkillId(aegis);
+    const desc = `-- Enable to use Level ${lv} of ${friendlySkill(aegis)}`;
+    if (skillId != null) return [`EnableSkill(${skillId}, ${lv})`, desc];
+    return [desc];
+  }
 
   // heal HP, SP;  →  "Restores N HP." / "Restores N SP." / both
   m = /^heal\s+(-?\d+)\s*,\s*(-?\d+)\b/i.exec(text);
@@ -1621,9 +1952,16 @@ function describeNonBonusCommand(raw) {
 // tooltip parser ("unexpected symbol near '.'" for `.@var`, or an
 // "attempt to perform arithmetic on global 'X' (nil)" runtime fault).
 // Used by translateScript() / emitBonus() to gate the final emit.
-// `\.@\w+` catches rAthena temp-vars (`.@val`, `.@r`) that weren't
-// resolved upstream — we'd rather drop the call than write broken Lua.
-const DYNAMIC_EXPR_RE = /\b(JobLevel|BaseLevel|getrefine|getequiprefinerycnt|getequipid|getequipweaponlv|readparam|isequipped|Upper)\b|\.@\w+/;
+//   \.@\w+        — rAthena temp-vars (`.@val`, `.@r`) left unresolved.
+//   SKID\.\d      — `SKID.62` (digit after dot is a Lua parse error: in
+//                    `SKID.62` Lua reads `.62` as the start of a number
+//                    literal and then trips on the trailing context).
+//   \?            — rAthena ternary `cond ? a : b`. Lua has no ternary —
+//                    leaking one causes `')' expected near '?'`.
+//   \b(Agi|Str|Vit|Int|Dex|Luk)\b — bare stat-name identifiers (rAthena
+//                    server-only; the client doesn't expose these globals
+//                    in the equipment tooltip context).
+const DYNAMIC_EXPR_RE = /\b(JobLevel|BaseLevel|getrefine|getequiprefinerycnt|getequipid|getequipweaponlv|readparam|isequipped|Upper|Agi|Str|Vit|Int|Dex|Luk)\b|\.@\w+|SKID\.\d|\?/;
 
 // Map rAthena equipment-slot constants used in getequiprefinerycnt(EQI_X)
 // / getequipid(EQI_X) to human-readable names for description-only comments.
@@ -1781,6 +2119,7 @@ function tokenizeRefineScript(script) {
     if (b) return { kind: "bonus", bname: b.bname, args: b.args, raw: b.raw.replace(/;\s*$/, "") + ";" };
     if (/^\s*(?:skill\s|autobonus\b|specialeffect\b|sc_start\b|sc_end\b|heal\b|callfunc\b|callsub\b|hateffect\b|set\s+\.@)/i.test(text)) {
       const desc = describeNonBonusCommand(text);
+      if (Array.isArray(desc)) return { kind: "multidesc", lines: desc, raw: text };
       if (desc) return { kind: "desc", desc, raw: text };
       return { kind: "todo", raw: text };
     }
@@ -2164,6 +2503,9 @@ function translateScriptRefineAware(script) {
     else if (s.kind === "bonus")    emitBonus(s, indent);
     else if (s.kind === "if")       emitIfStmt(s, indent);
     else if (s.kind === "desc")     { out.push(indent + `-- ${String(s.desc).replace(/\s*\r?\n\s*/g, " ")}`); }
+    else if (s.kind === "multidesc"){
+      for (const l of s.lines) out.push(indent + l);
+    }
     else if (s.kind === "todo")     { out.push(indent + `-- TODO: ${String(s.raw).replace(/\s*\r?\n\s*/g, " ")}`); }
     else if (s.kind === "raw")      { out.push(indent + `-- TODO: ${String(s.raw).replace(/\s*\r?\n\s*/g, " ")}`); }
   }
@@ -2240,8 +2582,13 @@ function translateScript(script) {
       // autobonus / ...): try to render a friendly description so the
       // tooltip can show *some* useful text instead of an opaque TODO.
       const desc = describeNonBonusCommand(raw);
-      if (desc) lines.push(`-- ${desc}`);
-      else lines.push(`-- TODO: ${raw.trim()}`);
+      if (Array.isArray(desc)) {
+        for (const l of desc) lines.push(l);
+      } else if (desc) {
+        lines.push(`-- ${desc}`);
+      } else {
+        lines.push(`-- TODO: ${raw.trim()}`);
+      }
       continue;
     }
     const bname = m[2].toLowerCase();
@@ -2485,11 +2832,36 @@ function normalizeHerculesItem(h) {
     // to an Aegis-ID range guess that misclassifies non-standard IDs and
     // produces a Stat table whose count mismatches the emitted Type.
     Subtype:    h.Subtype || h.SubType || "",
+    // Equip location string (`EQP_HEAD_TOP`, `EQP_COSTUME_HEAD_TOP`, etc.).
+    // Hercules `Loc:` is sometimes a string and sometimes a quoted list of
+    // strings — normalize to a single space-joined string for downstream
+    // matching (we only care about the prefix anyway).
+    Loc: Array.isArray(h.Loc) ? h.Loc.join(" ") : String(h.Loc || ""),
     Defense:    h.Def || 0,
     Refineable: h.Refine === true,
     Script:       h.Script       || "",
     EquipScript:  h.OnEquipScript || "",
   };
+}
+
+// True if this item is a "costume" slot (EQP_COSTUME_* / Costume_*). On
+// Project 255's kRO client costume armors get rejected with "Item[N] has
+// invalid 'Stat' table(count: 17)" when emitted with a 17-entry zero
+// Stat — the validator treats them like cards and expects no Stat field
+// at all. Detects both Hercules string form (`Loc: "EQP_COSTUME_HEAD_TOP"`)
+// and rAthena YAML map form (`Locations: { Costume_Head_Top: true }`).
+function isCostumeItem(item) {
+  if (!item) return false;
+  const loc = String(item.Loc || "");
+  if (/\bEQP_COSTUME_/i.test(loc) || /\bCostume_/i.test(loc)) return true;
+  // rAthena YAML uses a `Locations` map of slot-name → true.
+  const yamlLoc = item.Locations || item.Location;
+  if (yamlLoc && typeof yamlLoc === "object") {
+    for (const key of Object.keys(yamlLoc)) {
+      if (yamlLoc[key] && /^Costume_/i.test(key)) return true;
+    }
+  }
+  return false;
 }
 
 // Format an OnStartEquip block (lines, unindented items) for an item.
@@ -2501,9 +2873,28 @@ function normalizeHerculesItem(h) {
 // duplicating them in the per-item function would make the tooltip show
 // every set bonus the item *could* gain unconditionally, plus the client
 // would double-apply the effect when the set is actually completed.
+// Drop consecutive identical comment lines from a translated body. Items
+// with multiple combo entries that all expand to the same description (or
+// other duplicated emitter paths) would otherwise produce visually noisy
+// `-- X` `-- X` `-- X` runs in the .lub.
+function dedupeConsecutiveComments(body) {
+  const out = [];
+  let prev = null;
+  for (const l of body) {
+    const t = l.trim();
+    const isComment = t.startsWith("--");
+    if (isComment && prev !== null && t.replace(/,\s*$/, "") === prev) {
+      continue;
+    }
+    out.push(l);
+    prev = isComment ? t.replace(/,\s*$/, "") : null;
+  }
+  return out;
+}
+
 function buildOnStartEquipBlock(item) {
   const ownScript = collectScriptText(item);
-  const ownBody = ownScript ? translateScript(ownScript) : [];
+  const ownBody = ownScript ? dedupeConsecutiveComments(translateScript(ownScript)) : [];
 
   if (!ownBody.length) return null;
 
@@ -2758,10 +3149,23 @@ function statArraySize(lubType) {
 }
 
 function buildStatArray(item, lubType) {
-  const size = statArraySize(lubType || "armor");
+  const type = lubType || "armor";
+  const size = statArraySize(type);
   const stat = new Array(size).fill(0);
   stat[0] = parseInt(item.Defense || 0, 10) || 0;
-  stat[10] = item.Refineable ? 1 : 0;
+  // kRO format quirk: the "is equippable" flag slot must always be 1 for
+  // armor / weapons — even on items the YAML marks `Refine: false` (like
+  // costumes). Setting it to 0 makes the client reject the entry with
+  // "Item[N] has invalid 'Stat' table(count: 17)". Confirmed against stock
+  // FreyjaRO output where 100% of armor + weapon entries have the flag set.
+  //   - armor / Mweapon (17 entries) → slot[10] = 1
+  //   - Rweapon         (15 entries) → slot[8]  = 1
+  //   - ammo            ( 2 entries) → no flag slot
+  if (type === "Rweapon") {
+    stat[8] = 1;
+  } else if (type !== "ammo") {
+    stat[10] = 1;
+  }
   return stat;
 }
 
@@ -2781,9 +3185,11 @@ function buildFullEntry(item) {
 
   const lines = [`  [${itemId}] = {`];
   lines.push(`    Type = "${lubType}",`);
-  // For cards with no defensive stats (DEF=0, Refineable=false) the canonical
-  // kRO format omits the Stat field entirely. Emitting `Stat = { 0,0,...,0 }`
-  // triggers the client warning "Item[N] has invalid 'Stat' table(count: 0)".
+  // Cards with no defensive stats omit the Stat field entirely — emitting
+  // `Stat = {0,0,...,0}` trips "Item[N] has invalid 'Stat' table(count: 0)".
+  // Everything else (including costumes) needs the full Stat per
+  // statArraySize(lubType) with the "is equippable" flag set — see
+  // buildStatArray() for the per-type slot conventions.
   const statArr = buildStatArray(item, lubType);
   const skipStat = lubType === "card" && statArr.every(v => v === 0);
   if (!skipStat) {
@@ -3224,6 +3630,229 @@ function trimOrphanItemsAtEOF(lines) {
   return { lines: trimmed, removed: lines.length - trimmed.length };
 }
 
+// Marker that lets us detect whether an Order file has already been patched
+// by a previous run. Re-patching would create duplicate Order entries which
+// the kRO validator rejects ("invalid 'uniq2' field").
+const RDL_ORDER_MARKER = "-- RDL custom: skill grant";
+
+// Stub Lua + Order entries injected into every sibling
+// EquipmentPropertiesOrder*.lub so the tooltip renderer knows how to
+// display AutoSpell / AddEffectOnAttack / EnableSkill / AddMaxWeight calls
+// our generator emits. Pure no-ops at runtime — the actual gameplay
+// effect is server applied; this is purely for client-side tooltip text.
+const RDL_ORDER_STUB_BLOCK = `
+
+-- ============================================================
+--   RDL custom stubs for AutoSpell / AddEff / MaxWeight tooltip support
+-- ------------------------------------------------------------
+-- Emitted by EquipmentProperties.lub for bonuses that have no native
+-- kRO tooltip handler. We stub them as no-ops and let the Order entries
+-- [7]-[11] below render the descriptive text.
+-- ============================================================
+function AddAutoSpell(skill_id, level, chance) end
+function AddAutoSpellWhenHit(skill_id, level, chance) end
+function AddEffectOnAttack(effect_id, chance) end
+function AddMaxWeight(amount) end
+function SubMaxWeight(amount) end
+if type(GetEffectName) ~= "function" then
+  local EFF_NAMES = {
+    [1]="Stun",[2]="Frozen",[3]="Stone",[4]="Sleep",[5]="Poisoned",
+    [6]="Cursed",[7]="Silenced",[8]="Confused",[9]="Blind",[10]="Bleeding",
+    [11]="Deadly Poison",[127]="Burning",[128]="Freezing",
+  }
+  function GetEffectName(id)
+    return EFF_NAMES[tonumber(id) or 0] or ("Effect " .. tostring(id))
+  end
+end
+`;
+
+const RDL_ORDER_ENTRIES = `,
+\t\t\t-- ${RDL_ORDER_MARKER.replace("-- ", "")} (Marine Sphere etc.). Built-in EnableSkill.
+\t\t\t[7] = {
+\t\t\t\tname = "Enable to use Level {val} of {sep}",
+\t\t\t\tfunc = { "EnableSkill" },
+\t\t\t\tval = { [2] = Operation.ADD },
+\t\t\t\tsep = { [1] = "GetSkillName" }
+\t\t\t},
+\t\t\t-- RDL custom: auto-cast on attack (AddAutoSpell stub).
+\t\t\t[8] = {
+\t\t\t\tname = "Random chance to auto-cast Level {val} of {sep} on attack",
+\t\t\t\tfunc = { "AddAutoSpell" },
+\t\t\t\tval = { [2] = Operation.ADD },
+\t\t\t\tsep = { [1] = "GetSkillName" }
+\t\t\t},
+\t\t\t-- RDL custom: auto-cast when hit (AddAutoSpellWhenHit stub).
+\t\t\t[9] = {
+\t\t\t\tname = "Random chance to auto-cast Level {val} of {sep} when hit",
+\t\t\t\tfunc = { "AddAutoSpellWhenHit" },
+\t\t\t\tval = { [2] = Operation.ADD },
+\t\t\t\tsep = { [1] = "GetSkillName" }
+\t\t\t},
+\t\t\t-- RDL custom: inflict status on attack (AddEffectOnAttack stub).
+\t\t\t[10] = {
+\t\t\t\tname = "Has {val}% chance of inflicting {sep} when attacking",
+\t\t\t\tfunc = { "AddEffectOnAttack" },
+\t\t\t\tval = { [2] = Operation.ADD },
+\t\t\t\tsep = { [1] = "GetEffectName" }
+\t\t\t},
+\t\t\t-- RDL custom: max weight bonus (AddMaxWeight stub).
+\t\t\t[11] = {
+\t\t\t\tname = "{sym}{val}#Max Weight",
+\t\t\t\tfunc = { "AddMaxWeight", "SubMaxWeight" },
+\t\t\t\tval = { [1] = Operation.ADD },
+\t\t\t\tsym = SymbolPreset.IncSign
+\t\t\t}`;
+
+// Write a fresh EquipmentPropertiesOrder.lub from the bundled template
+// alongside the source .lub. The template ships pre-patched with the RDL
+// custom Order entries [7]-[10] + stub Lua functions, so the kRO tooltip
+// renderer always has the right definitions even if the user's GRF patcher
+// overwrites the file. Existing destination is backed up first.
+async function writeOrderFromTemplate(srcLubPath, logFn) {
+  if (!srcLubPath) return { written: false };
+  const sep = srcLubPath.includes("\\") ? "\\" : "/";
+  const dir = srcLubPath.split(/[\\\/]/).slice(0, -1).join(sep);
+  if (!dir) return { written: false };
+  const destPath = dir + sep + "EquipmentPropertiesOrder.lub";
+
+  // Locate the bundled template. Same lookup chain loadBonusTemplates uses:
+  // (1) next to the exe, (2) <exe>\Resources\, (3) bundled via fetch().
+  const exeDir = (typeof NL_PATH === "string" && NL_PATH) ? NL_PATH : "";
+  const candidates = [];
+  if (exeDir) {
+    candidates.push(exeDir + "\\EquipmentPropertiesOrder.template.lub");
+    candidates.push(exeDir + "\\Resources\\EquipmentPropertiesOrder.template.lub");
+  }
+  let templateText = null;
+  for (const p of candidates) {
+    const txt = await tryReadFile(p);
+    if (txt) { templateText = txt; break; }
+  }
+  if (!templateText) {
+    try {
+      const res = await fetch("EquipmentPropertiesOrder.template.lub", { cache: "no-store" });
+      if (res.ok) templateText = await res.text();
+    } catch {}
+  }
+  if (!templateText) {
+    if (typeof logFn === "function") logFn("Order template: bundle missing, skipping fresh-write step.");
+    return { written: false };
+  }
+
+  // Compare to existing — if identical, skip (no need to bump mtime).
+  try {
+    const existing = await Neutralino.filesystem.readFile(destPath);
+    if (existing === templateText) {
+      if (typeof logFn === "function") logFn(`Order.lub: already matches bundled template (${templateText.length} bytes).`);
+      return { written: false, unchanged: true };
+    }
+    // Backup before overwrite.
+    await Neutralino.filesystem.writeFile(destPath + ".pre-rdl-template.bak", existing);
+  } catch {
+    // Destination doesn't exist — that's fine, we'll create it.
+  }
+  await Neutralino.filesystem.writeFile(destPath, templateText);
+  if (typeof logFn === "function") {
+    logFn(`Order.lub: wrote bundled template (${templateText.length} bytes) to ${destPath}`);
+  }
+  return { written: true, destPath };
+}
+
+// Patch all sibling EquipmentPropertiesOrder*.lub files alongside the
+// source .lub. Idempotent — checks for RDL_ORDER_MARKER before touching
+// anything. Returns { patched: [paths], skipped: [paths], errors: [{path, msg}] }.
+async function patchOrderFiles(srcLubPath, logFn) {
+  const result = { patched: [], skipped: [], errors: [] };
+  if (!srcLubPath) return result;
+  const sep = srcLubPath.includes("\\") ? "\\" : "/";
+  const dir = srcLubPath.split(/[\\\/]/).slice(0, -1).join(sep);
+  if (!dir) return result;
+
+  // Look for any file named EquipmentPropertiesOrder[N].lub in the same dir.
+  let entries = [];
+  try {
+    entries = await Neutralino.filesystem.readDirectory(dir);
+  } catch (e) {
+    return result;
+  }
+  const candidates = entries
+    .filter(e => e.type === "FILE" && /^EquipmentPropertiesOrder\d*\.lub$/i.test(e.entry))
+    .map(e => dir + sep + e.entry);
+
+  for (const path of candidates) {
+    try {
+      const text = await Neutralino.filesystem.readFile(path);
+      // Already patched AND has the latest entry [11] AddMaxWeight stub?
+      // Skip. If [11] is missing (old v1 patch), fall through to re-patch
+      // so the user gets the new tooltip render rules.
+      if (text.includes(RDL_ORDER_MARKER) && /func\s*=\s*\{\s*"AddMaxWeight"/.test(text)) {
+        result.skipped.push(path);
+        continue;
+      }
+      // Old-version patch detected — strip the previous RDL block first so
+      // we don't end up with duplicate entries (which the kRO validator
+      // rejects with "invalid 'uniq2' field").
+      let strippedText = text;
+      if (text.includes(RDL_ORDER_MARKER)) {
+        // Drop the stub block and the entries [7]..[N]
+        strippedText = strippedText.replace(
+          /\s*-- =+\s*\n--\s+RDL custom stubs[\s\S]*?-- =+\s*\nfunction AddAutoSpell[\s\S]*?\nend\s*\n(?:end\s*\n)?/m,
+          ""
+        );
+        strippedText = strippedText.replace(
+          /,\s*\n\s*-- RDL custom: skill grant[\s\S]*?\}\s*(?=\n\s*\}\s*\n\s*\},)/m,
+          ""
+        );
+      }
+      // Step 1: inject stub block after `EnumVAR = EnumVAR or {}` (or at
+      // the very top if no such line exists). Use the strippedText so we
+      // don't double-up on an existing (older) RDL block.
+      let patched = strippedText;
+      const enumMarker = "EnumVAR = EnumVAR or {}";
+      if (patched.includes(enumMarker)) {
+        patched = patched.replace(enumMarker, enumMarker + RDL_ORDER_STUB_BLOCK);
+      } else {
+        patched = RDL_ORDER_STUB_BLOCK + "\n" + patched;
+      }
+      // Step 2: inject Order entries after the AddDamage_SKID entry in
+      // section [6] (Skill). Match the closing `}` of that entry, optionally
+      // followed by a "Removed [7]" comment block.
+      const orderPattern = /(sep\s*=\s*\{\s*\[2\]\s*=\s*"GetAddDamageSkillName"\s*\}\s*\})(\s*--\s*Removed\s*\[7\][^\n]*\n\s*--[^\n]*)?/;
+      if (orderPattern.test(patched)) {
+        patched = patched.replace(orderPattern, "$1" + RDL_ORDER_ENTRIES);
+        // Write a backup + the new content.
+        await Neutralino.filesystem.writeFile(path + ".pre-rdl-custom.bak", text);
+        await Neutralino.filesystem.writeFile(path, patched);
+        result.patched.push(path);
+      } else {
+        result.errors.push({ path, msg: "AddDamage_SKID anchor not found — Order file may use a different layout." });
+      }
+    } catch (e) {
+      result.errors.push({ path, msg: String(e.message || e) });
+    }
+  }
+
+  // Report what happened so the user can see Order file activity in the log.
+  if (typeof logFn === "function") {
+    if (result.patched.length) {
+      logFn(`Order files: patched ${result.patched.length} (RDL custom entries added).`);
+      for (const p of result.patched) logFn(`  + ${p}`);
+    }
+    if (result.skipped.length) {
+      logFn(`Order files: ${result.skipped.length} already up-to-date.`);
+    }
+    if (result.errors.length) {
+      for (const err of result.errors) {
+        logFn(`Order file warning: ${err.path} — ${err.msg}`);
+      }
+    }
+    if (!result.patched.length && !result.skipped.length && !result.errors.length) {
+      logFn(`Order files: none found alongside source (looked in ${srcLubPath}'s directory).`);
+    }
+  }
+  return result;
+}
+
 function applyEntries(sourceText, yamlItems, logFn, options) {
   const newCombiEntries = (options && options.newCombiEntries) || [];
   let lines = sourceText.split(/\r?\n/);
@@ -3315,23 +3944,23 @@ function applyEntries(sourceText, yamlItems, logFn, options) {
     const isCard = lubTypeHere === "card";
     const expectedCount = statArraySize(lubTypeHere);
     const newStatArr = buildStatArray(item, lubTypeHere);
-    const cardNeedsStat = !isCard || newStatArr.some(v => v !== 0);
+    const needsStat = !isCard || newStatArr.some(v => v !== 0);
     const statRange = findStatRange(lines, spanS, spanE);
     const statCount = countStatEntries(lines, statRange);
-    if (isCard && !cardNeedsStat && statRange) {
+    if (isCard && !needsStat && statRange) {
       // Card with no defensive stats but file has a Stat block → drop it.
       lines.splice(statRange[0], statRange[1] - statRange[0] + 1);
       logFn(`  modified [${id}] - dropped all-zero Stat from card`);
       cnt_stat_repaired++;
       [spanS, spanE] = [spanS, findMatchingBrace(lines, spanS)];
-    } else if (statRange && statCount !== expectedCount && cardNeedsStat) {
+    } else if (statRange && statCount !== expectedCount && needsStat) {
       const fixedLine = `    Stat = ${formatStatArray(newStatArr)},`;
       const fixedBlock = fixedLine.split("\n");
       lines.splice(statRange[0], statRange[1] - statRange[0] + 1, ...fixedBlock);
       logFn(`  modified [${id}] - repaired Stat table (was count=${statCount}, now ${expectedCount}; type=${lubTypeHere}, DEF=${parseInt(item.Defense || 0, 10) || 0}, Refineable=${item.Refineable ? 1 : 0})`);
       cnt_stat_repaired++;
       [spanS, spanE] = [spanS, findMatchingBrace(lines, spanS)];
-    } else if (!statRange && cardNeedsStat) {
+    } else if (!statRange && needsStat) {
       // No Stat field at all and the item actually needs one → insert it.
       const spanEnd = findMatchingBrace(lines, spanS);
       const fixedLine = `    Stat = ${formatStatArray(newStatArr)},`;
@@ -3400,17 +4029,32 @@ function applyEntries(sourceText, yamlItems, logFn, options) {
         // Replacing instead of merging would silently destroy stock combos.
         let mergedIds = [...ids];
         if (existingCombi) {
-          // Extract only numbers BETWEEN the field's `{` and matching `}`,
-          // ignoring everything else on those lines (avoids picking up
-          // negative values from neighbouring AddExtParam calls if the
-          // range is somehow off). Negative numbers can't be item / set
-          // IDs anyway — drop them defensively.
+          // Extract only numbers BETWEEN the field's `{` and matching `}`.
+          // CRITICAL filter: keep only real combo set IDs (>= 2_000_000_000).
+          // Older broken runs wrote *partner item IDs* (small numbers like
+          // 2357, 5171) into Combiitem — those aren't valid set IDs and
+          // the kRO client ignores them, so the (C) suffix never appears.
+          // Dropping them on every Apply is how the field self-heals.
           const fieldText = lines.slice(existingCombi[0], existingCombi[1] + 1).join("\n");
           const braceMatch = fieldText.match(/\{([\s\S]*?)\}/);
           const inner = braceMatch ? braceMatch[1] : "";
           const existingNums = (inner.match(/\d+/g) || [])
-            .map(Number).filter(n => Number.isFinite(n) && n > 0);
+            .map(Number).filter(n => Number.isFinite(n) && n >= 2000000000);
           mergedIds = [...new Set([...existingNums, ...ids])].sort((a, b) => a - b);
+        }
+        // Filter out DANGLING set IDs — references to combo entries that
+        // don't actually exist in the global Combiitem table. The kRO client
+        // bails on the entire Combiitem field when one ref can't be
+        // resolved, so dangling IDs silently break OTHER (valid) combos
+        // on the same item.
+        const validSetIds = (options && options.validSetIds) || null;
+        if (validSetIds) {
+          mergedIds = mergedIds.filter(n => validSetIds.has(n));
+        }
+        if (mergedIds.length === 0) {
+          // Nothing valid to write — skip the field entirely so we don't
+          // leave an empty `Combiitem = {}` lying around.
+          continue;
         }
         const combiLine = `    Combiitem = ${formatCombiitem(mergedIds)},`;
         const newCombiBlock = combiLine.split("\n");
@@ -3807,8 +4451,37 @@ document.getElementById("run").onclick = async () => {
       }
     }
 
+    // Compute the set of "known good" combo set IDs the kRO client will be
+    // able to resolve after this Apply: every ID already in the source's
+    // global Combiitem table plus every ID we're about to append. The
+    // per-item Combiitem writer drops references not in this set (dangling
+    // refs make kRO bail on the whole field, hiding OTHER valid combos).
+    const validSetIds = new Set();
+    try {
+      const srcLines = sourceText.split(/\r?\n/);
+      const existing = parseExistingCombiTable(srcLines);
+      for (const id of existing.usedIds) validSetIds.add(id);
+    } catch {}
+    for (const e of pendingCombiEntries) validSetIds.add(e.setId);
+
+    // Write a fresh EquipmentPropertiesOrder.lub from the bundled template.
+    // The template ships pre-patched with RDL custom Order entries, so this
+    // makes the kRO tooltip renderer consistent with what we're about to
+    // emit into EquipmentProperties.lub — even if the user's GRF patcher
+    // overwrote Order.lub since the last Apply.
+    try { await writeOrderFromTemplate(effectiveSrc, log); }
+    catch (e) { log(`Order-template write error: ${e.message || e}`); }
+
+    // Also patch any OTHER sibling Order*.lub files (Order2.lub, etc.) that
+    // we don't fully replace. Idempotent — files already marked are skipped.
+    try { await patchOrderFiles(effectiveSrc, log); }
+    catch (e) { log(`Order-file patch error: ${e.message || e}`); }
+
     log(`Applying ${body.length} item(s)…`);
-    const updated = applyEntries(sourceText, body, log, { newCombiEntries: pendingCombiEntries });
+    const updated = applyEntries(sourceText, body, log, {
+      newCombiEntries: pendingCombiEntries,
+      validSetIds,
+    });
 
     // Write a backup next to the source before overwriting.
     const bakPath = effectiveSrc + ".bak";
@@ -4269,5 +4942,5 @@ Neutralino.events.on("ready", async () => {
 // Build marker — if you don't see this exact tag in the log on startup,
 // the running app is still loading an older resources.neu and needs a
 // full restart (close the window AND make sure the process has exited).
-const BUILD_TAG = "build-2026-05-21-orphan-safe-r5";
+const BUILD_TAG = "build-2026-05-22-card-stat-r23";
 log(`Ready. [${BUILD_TAG}]`);
