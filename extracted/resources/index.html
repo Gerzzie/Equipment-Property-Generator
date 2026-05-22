@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>RDL — Equipment Property Generator</title>
+  <link rel="icon" type="image/png" href="icons/favicon.png" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="window">
+
+    <!-- ========================================================
+         Menu bar (File / Edit)
+         ======================================================== -->
+    <nav class="menubar" id="menubar">
+      <div class="menu">
+        <button class="menu-btn" data-menu="file">File</button>
+        <div class="menu-dropdown" data-menu="file">
+          <button id="new-session"  class="menu-item">New Session</button>
+          <button id="save-session" class="menu-item">Save Session…</button>
+          <button id="load-session" class="menu-item">Load Session…</button>
+          <div class="menu-sep"></div>
+          <button id="open-folder" class="menu-item">Open Source Folder</button>
+          <button id="clear-log"   class="menu-item">Clear Log</button>
+          <div class="menu-sep"></div>
+          <button id="about"       class="menu-item">About</button>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn" data-menu="edit">Edit</button>
+        <div class="menu-dropdown" data-menu="edit">
+          <button id="custom-bonuses" class="menu-item">Custom Bonuses</button>
+          <button id="edit-labels"    class="menu-item">Edit Labels</button>
+        </div>
+      </div>
+    </nav>
+
+    <!-- ========================================================
+         Form (Source .lub / Input YAML)
+         ======================================================== -->
+    <section class="form">
+      <div class="row">
+        <label for="src">Source .lub</label>
+        <input id="src" type="text" spellcheck="false" />
+        <button id="browse-src" type="button">Browse…</button>
+      </div>
+      <div class="row row-multi-db">
+        <label id="yml-label">Input YAMLs</label>
+        <div class="db-stack">
+          <div class="db-list" id="db-list"></div>
+          <div class="db-stack-foot">
+            <span class="db-hint">Top = highest priority. Lower DBs are ignored when an item ID conflicts.</span>
+            <button id="add-db" type="button">+ Add DB</button>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <label for="combo" id="combo-label">Item Combo</label>
+        <input id="combo" type="text" spellcheck="false" placeholder="(optional)" />
+        <button id="browse-combo" type="button">Browse…</button>
+      </div>
+    </section>
+
+    <!-- ========================================================
+         Primary action (above log) + format toggle
+         ======================================================== -->
+    <section class="primary-bar">
+      <button id="run" type="button" class="primary primary-big">Apply to Source</button>
+      <div class="format-toggle" id="format-toggle" data-mode="rathena">
+        <button class="format-opt" data-mode="rathena" type="button">rAthena</button>
+        <button class="format-opt" data-mode="hercules" type="button">Hercules</button>
+        <span class="format-thumb"></span>
+      </div>
+    </section>
+
+    <!-- ========================================================
+         Log
+         ======================================================== -->
+    <section class="log-wrap">
+      <div class="log-title">Log</div>
+      <div id="log" class="log" aria-live="polite"></div>
+    </section>
+
+    <!-- ========================================================
+         Status bar
+         ======================================================== -->
+    <footer class="statusbar">
+      <span id="status">Ready</span>
+    </footer>
+  </main>
+
+  <!-- =========================================================
+       Custom Bonuses modal
+       ========================================================= -->
+  <div id="cb-modal" class="modal">
+    <div class="modal-backdrop"></div>
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title">Custom Bonuses</div>
+        <button id="cb-close" type="button" class="modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-hint">
+          Define rules for bonuses that aren't in the built-in table. Use
+          <code>{arg1}</code>, <code>{arg2}</code>, … as placeholders.
+          Example: name <code>bIncreasePogi</code>, args 1,
+          lua <code>IncreasePogi({arg1})</code>, description <code>Increase Pogi {arg1}%</code>.
+        </p>
+
+        <div id="cb-list" class="cb-list"></div>
+
+        <div class="cb-form">
+          <div class="cb-form-row">
+            <label for="cb-name">Name</label>
+            <input id="cb-name" type="text" placeholder="bIncreasePogi" spellcheck="false" />
+          </div>
+          <div class="cb-form-row">
+            <label for="cb-args">Args</label>
+            <input id="cb-args" type="number" min="0" max="5" value="1" />
+          </div>
+          <div class="cb-form-row">
+            <label for="cb-lua">Lua</label>
+            <input id="cb-lua" type="text" placeholder="IncreasePogi({arg1})" spellcheck="false" />
+          </div>
+          <div class="cb-form-row">
+            <label for="cb-desc">Description</label>
+            <input id="cb-desc" type="text" placeholder="Increase Pogi {arg1}%" spellcheck="false" />
+          </div>
+          <div class="cb-form-actions">
+            <button id="cb-add" type="button" class="primary">Add / Update</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       Labels editor modal
+       ========================================================= -->
+  <div id="lbl-modal" class="modal">
+    <div class="modal-backdrop"></div>
+    <div class="modal-dialog lbl-dialog">
+      <div class="modal-header">
+        <div class="modal-title">Edit Tooltip Labels</div>
+        <button id="lbl-close" type="button" class="modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-hint">
+          Edit the labels that appear in the in-game equipment properties tooltip.
+          These live in <code>EquipmentPropertiesOrder.lub</code> next to your source
+          <code>.lub</code>. Save to write changes back, then restart the client to
+          see them.
+        </p>
+
+        <div class="lbl-toolbar">
+          <input id="lbl-search" type="text" placeholder="Filter… (type to search)" spellcheck="false" />
+          <span class="spacer"></span>
+          <button id="lbl-reload" type="button">Reload</button>
+          <button id="lbl-save" type="button" class="primary">Save</button>
+        </div>
+
+        <div id="lbl-list" class="lbl-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       About modal
+       ========================================================= -->
+  <div id="about-modal" class="modal">
+    <div class="modal-backdrop"></div>
+    <div class="modal-dialog about-dialog">
+      <div class="modal-header">
+        <div class="modal-title">About</div>
+        <button id="about-close" type="button" class="modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body about-body">
+        <div class="about-title">RDL — Equipment Property Generator</div>
+        <div class="about-version">Version 1.0.0 · April 2026</div>
+
+        <p class="about-text">
+          A tool for generating and merging rAthena item_db YAML bonuses
+          into FreyjaRO / ROenglishRE <code>EquipmentProperties.lub</code>,
+          with in-app editors for custom bonus translations and tooltip labels.
+        </p>
+
+        <div class="about-credits">
+          <div class="about-row">
+            <span class="about-k">Developed by</span>
+            <span class="about-v">Gerzzie</span>
+          </div>
+          <div class="about-row">
+            <span class="about-k">For</span>
+            <span class="about-v">Ragnarok Developer Lounge</span>
+          </div>
+          <div class="about-row">
+            <span class="about-k">Year</span>
+            <span class="about-v">April 2026</span>
+          </div>
+        </div>
+
+        <div class="about-link-row">
+          <button id="about-open-site" type="button">Visit RDL Website</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast notifications -->
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <script src="js/neutralino.js"></script>
+  <script src="js/js-yaml.min.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

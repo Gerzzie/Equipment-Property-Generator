@@ -1,0 +1,60 @@
+{
+  "$schema": "https://raw.githubusercontent.com/neutralinojs/neutralinojs/main/schemas/neutralino.config.schema.json",
+  "applicationId": "com.freyja.itemequipgen",
+  "version": "1.0.0",
+  "defaultMode": "window",
+  "port": 0,
+  "documentRoot": "/resources/",
+  "url": "/",
+  "enableServer": true,
+  "enableNativeAPI": true,
+  "tokenSecurity": "one-time",
+  "logging": {
+    "enabled": false,
+    "writeToLogFile": false
+  },
+  "nativeAllowList": [
+    "app.*",
+    "window.*",
+    "os.showOpenDialog",
+    "os.showSaveDialog",
+    "os.showMessageBox",
+    "os.open",
+    "os.getEnv",
+    "os.getPath",
+    "filesystem.readFile",
+    "filesystem.writeFile",
+    "filesystem.getStats",
+    "filesystem.createDirectory",
+    "filesystem.getPathParts",
+    "events.*",
+    "debug.log"
+  ],
+  "modes": {
+    "window": {
+      "title": "RDL - Equipment Property Generator",
+      "width": 900,
+      "height": 580,
+      "minWidth": 820,
+      "minHeight": 500,
+      "center": true,
+      "fullScreen": false,
+      "alwaysOnTop": false,
+      "icon": "/resources/icons/appIcon.png",
+      "enableInspector": false,
+      "borderless": false,
+      "maximize": false,
+      "hidden": false,
+      "resizable": true,
+      "exitProcessOnClose": true
+    }
+  },
+  "cli": {
+    "binaryName": "ItemEquipGen",
+    "resourcesPath": "/resources/",
+    "extensionsPath": "/extensions/",
+    "clientLibrary": "/resources/js/neutralino.js",
+    "binaryVersion": "6.7.0",
+    "clientVersion": "6.7.0"
+  }
+}
