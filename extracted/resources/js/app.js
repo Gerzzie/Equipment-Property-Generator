@@ -1753,6 +1753,16 @@ function scriptUsesRefine(script) {
   return REFINE_CALL_RE.test(script || "");
 }
 
+// True if the script contains an `if (...)` conditional. Such scripts route
+// through the structured (refine-aware) translator even without refine math,
+// so a multi-line condition collapses into a single "When X:" header instead
+// of the simple line-by-line path shredding it into raw `-- TODO: ||…`
+// fragments (and the structured emitter also drops dynamic calls while keeping
+// their descriptions, avoiding redundant `-- TODO dynamic expression` lines).
+function scriptHasConditional(script) {
+  return /(?:^|[\s;{}])if\s*\(/.test(script || "");
+}
+
 function balanced(s) {
   let d = 0;
   for (const c of s) {
@@ -2030,6 +2040,21 @@ const PARAM_NAME_FRIENDLY = {
 // "Has X% chance to:" / "When STR ≥ 120:" headers instead of opaque TODOs.
 // Returns null when no recognised pattern matches. Caller falls back to
 // "-- TODO: ... (condition not translatable)".
+// rAthena weapon SubType constant → friendly tooltip name. Used to describe
+// `getiteminfo(getequipid(EQI_X), ITEMINFO_SUBTYPE) == W_Y` weapon-class
+// conditions (common in spell/staff combos) as readable text.
+const WEAPON_SUBTYPE_NAMES = {
+  W_FIST: "Bare Fist", W_DAGGER: "Dagger", W_1HSWORD: "One-Handed Sword",
+  W_2HSWORD: "Two-Handed Sword", W_1HSPEAR: "One-Handed Spear",
+  W_2HSPEAR: "Two-Handed Spear", W_1HAXE: "One-Handed Axe", W_2HAXE: "Two-Handed Axe",
+  W_MACE: "Mace", W_2HMACE: "Two-Handed Mace", W_STAFF: "Staff",
+  W_2HSTAFF: "Two-Handed Staff", W_BOW: "Bow", W_KNUCKLE: "Knuckle",
+  W_MUSICAL: "Musical Instrument", W_WHIP: "Whip", W_BOOK: "Book",
+  W_KATAR: "Katar", W_REVOLVER: "Revolver", W_RIFLE: "Rifle",
+  W_GATLING: "Gatling Gun", W_SHOTGUN: "Shotgun", W_GRENADE: "Grenade Launcher",
+  W_HUUMA: "Huuma Shuriken",
+};
+
 function describeCondition(condInnerRaw) {
   let c = String(condInnerRaw || "").trim();
   while (/^\(.+\)$/.test(c) && balanced(c.slice(1, -1))) c = c.slice(1, -1).trim();
@@ -2136,6 +2161,27 @@ function describeCondition(condInnerRaw) {
   if (m) {
     const sym = { ">=": "≥", ">": ">", "<=": "≤", "<": "<", "==": "=" }[m[2]];
     return `When ${m[1]} ${sym} ${m[3]}`;
+  }
+
+  // getiteminfo(getequipid(EQI_X), ITEMINFO_SUBTYPE) == W_Y  (OR-chained) —
+  // weapon-class checks. Render the friendly weapon names so the tooltip reads
+  // "When equipped weapon is a Staff or Two-Handed Staff" instead of leaking
+  // raw getiteminfo() fragments. Each OR-term must be the same weapon-subtype
+  // shape; mixed conditions fall through to null.
+  const SUBTYPE_TERM_RE =
+    /^getiteminfo\s*\(\s*getequipid\s*\(\s*[A-Za-z_]\w*\s*\)\s*,\s*ITEMINFO_SUBTYPE\s*\)\s*==\s*(W_\w+)$/i;
+  const subtypeChain = c.split(/\s*\|\|\s*/).map(o => {
+    let s = o.trim();
+    while (/^\(.+\)$/.test(s) && balanced(s.slice(1, -1))) s = s.slice(1, -1).trim();
+    const mm = SUBTYPE_TERM_RE.exec(s);
+    return mm ? mm[1].toUpperCase() : null;
+  });
+  if (subtypeChain.length && subtypeChain.every(Boolean)) {
+    const names = [...new Set(subtypeChain.map(w => WEAPON_SUBTYPE_NAMES[w] || w))];
+    const list = names.length === 1
+      ? names[0]
+      : names.slice(0, -1).join(", ") + " or " + names[names.length - 1];
+    return `When equipped weapon is a ${list}`;
   }
 
   return null;
@@ -2332,6 +2378,20 @@ function translateScriptRefineAware(script) {
 
   function emitBonus(s, indent) {
     indent = indent || "";
+    // Custom bonus rules take priority — mirror the simple line-by-line path so
+    // user-defined bonuses still translate when they appear inside an `if (...)`
+    // block (the structured path is now used for all conditional scripts, not
+    // just refine ones).
+    const custom = findCustomBonus(s.bname);
+    if (custom) {
+      if (custom.description) out.push(indent + `-- ${applyTemplate(custom.description, s.args)}`);
+      if (custom.lua) {
+        for (const ln of applyTemplate(custom.lua, s.args).split(/\r?\n/)) {
+          if (ln.trim()) out.push(indent + ln);
+        }
+      }
+      return;
+    }
     // Translator gave up entirely (unknown bname / unsupported arg count) —
     // fall through to a description-only line so the bonus shows up in the
     // tooltip even if we can't emit a real call.
@@ -2405,6 +2465,15 @@ function translateScriptRefineAware(script) {
     const desc = formatBonusDescription(s.bname, s.args);
     if (desc) out.push(indent + `-- ${desc}${scalar.usesR ? " (scales with refine)" : ""}`);
     if (scalar.usesR) usesR = true;
+    // exprToLua() passes server-only calls (getequipid, JobLevel, …) through
+    // verbatim; emitting them would crash the client at equip time, and the
+    // line sanitizer would otherwise turn them into a redundant "-- TODO unsafe
+    // expression" dump right after the description. Drop the call when it
+    // embeds such an expression — the description above documents the intent.
+    if (DYNAMIC_EXPR_RE.test(calls.join(" "))) {
+      if (!desc) out.push(indent + `-- TODO dynamic expression (not emitted): ${s.raw}`);
+      return;
+    }
     for (const c of calls) out.push(indent + c);
   }
 
@@ -2593,12 +2662,18 @@ function sanitizeEmittedLines(lines) {
 }
 
 function translateScript(script) {
-  // If the script references getrefine()/getequiprefinerycnt(), route it
-  // through the refine-aware translator so the resulting Lua actually scales
-  // with refine level at equip time. Otherwise fall through to the legacy
-  // literal-inlining path.
-  if (scriptUsesRefine(script)) {
-    return translateScriptRefineAware(script);
+  // If the script references getrefine()/getequiprefinerycnt(), or contains an
+  // `if (...)` conditional, route it through the refine-aware structured
+  // translator: it scales Lua with refine at equip time AND renders conditions
+  // as a single "When X:" header instead of shredded `-- TODO: ||…` fragments.
+  // Otherwise fall through to the legacy literal-inlining path.
+  if (scriptUsesRefine(script) || scriptHasConditional(script)) {
+    const structured = translateScriptRefineAware(script);
+    // Guard against a structured-parse bailout (tokenise error → a single
+    // "-- TODO: tokenise error…" line): fall back to the simple path so we
+    // never regress a previously-handled flat script to a bare error comment.
+    const bailed = structured.length === 1 && /tokenise error/.test(structured[0]);
+    if (!bailed) return structured;
   }
   // Resolve `.@var = expr;` assignments into inline substitutions before
   // line-by-line translation. Also strips the assignment lines so they
@@ -2684,7 +2759,11 @@ function translateScript(script) {
     if (Array.isArray(result) && result.length === 0) continue;
     const emitted = Array.isArray(result) ? result.join(" ") : String(result);
     if (DYNAMIC_EXPR_RE.test(emitted)) {
-      lines.push(`-- TODO dynamic expression (not emitted): ${raw.trim()}`);
+      // The bonus value is a runtime expression we can't safely emit. If we
+      // already pushed a human-readable description above, that line IS the
+      // documentation — don't follow it with a redundant raw `-- TODO dynamic
+      // expression` dump. Only emit the TODO when there's no description.
+      if (!desc) lines.push(`-- TODO dynamic expression (not emitted): ${raw.trim()}`);
       continue;
     }
 
@@ -3148,21 +3227,24 @@ function formatCombiTableEntry(setId, partnerIds, script, indent) {
   out.push(`${indent}[${setId}] = {`);
   out.push(`${inner}Item = { ${partnerIds.join(", ")} },`);
 
-  const luaLines = (script && script.trim())
-    ? translateScript(script).filter(l => l.trim()).map(l => inner + "\t" + l)
+  // translateScript() returns body lines with no leading indent; we apply the
+  // correct depth per case below.
+  const body = (script && script.trim())
+    ? translateScript(script).filter(l => l.trim())
     : [];
-  const realCallLines = luaLines.filter(l => {
-    const t = l.trim();
-    return t && !t.startsWith("--");
-  });
-  if (realCallLines.length) {
+  const hasRealCall = body.some(l => !l.trim().startsWith("--"));
+  if (hasRealCall) {
+    // Real Lua calls → wrap in an OnStartEquip function at field depth, with
+    // the body one level deeper.
     out.push(`${inner}OnStartEquip = function()`);
-    for (const l of luaLines) out.push(l);
+    for (const l of body) out.push(inner + "\t" + l);
     out.push(`${inner}end`);
   } else {
-    // No translatable bonuses — surface as inline comments so the user can
-    // still see what the combo is supposed to do, even with no Lua body.
-    for (const l of luaLines) out.push(l);
+    // No translatable bonuses (e.g. only dynamic getequip* expressions) — there
+    // is no function to wrap them, so surface the lines as comments at the SAME
+    // depth as Item. Indenting them to OnStartEquip-body depth (inner + "\t")
+    // produced orphaned, over-indented comments dangling under Item.
+    for (const l of body) out.push(inner + l);
   }
   out.push(`${indent}}`);
   return out;
