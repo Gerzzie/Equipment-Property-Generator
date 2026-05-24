@@ -4030,6 +4030,26 @@ function applyEntries(sourceText, yamlItems, logFn, options) {
       logFn(`  modified [${id}] - added missing Stat table`);
       cnt_stat_added++;
       [spanS, spanE] = [spanS, findMatchingBrace(lines, spanS)];
+    } else if (statRange && statCount === expectedCount && needsStat) {
+      // Count is already correct, so the rebuild branch above won't fire — but
+      // slot 0 (DEF) may be a stale stock kRO value that disagrees with the
+      // source DB. e.g. item 2115 ships with DEF 80 in the .lub while the
+      // rAthena YAML says Defense: 3. Reconcile ONLY slot 0 from the source's
+      // Defense, replacing just the first numeric token so every other slot
+      // (slot 9 = MDEF, slot 10 = refine flag, stat bonuses, …) and the
+      // original single-/multi-line layout are preserved untouched.
+      const existingVals = parseStatValues(lines, statRange);
+      const srcDef = parseInt(item.Defense || 0, 10) || 0;
+      if (existingVals && existingVals.length && existingVals[0] !== srcDef) {
+        const oldDef = existingVals[0];
+        const block = lines.slice(statRange[0], statRange[1] + 1).join("\n");
+        // Replace the first numeric literal after the opening brace (= slot 0).
+        const rebuilt = block.replace(/(\{\s*)(-?\d+)/, `$1${srcDef}`);
+        lines.splice(statRange[0], statRange[1] - statRange[0] + 1, ...rebuilt.split("\n"));
+        logFn(`  modified [${id}] - synced DEF ${oldDef} → ${srcDef} from source DB`);
+        cnt_stat_repaired++;
+        [spanS, spanE] = [spanS, findMatchingBrace(lines, spanS)];
+      }
     }
 
     // ---- Dedup against the Stat block ----
