@@ -3252,11 +3252,16 @@ function stripLuaStrings(line) {
 }
 
 function stripLuaComment(line) {
-  // Very simple: strip `-- ...` to EOL (doesn't handle long comments [[ ]]).
-  const clean = stripLuaStrings(line);
-  const idx = clean.indexOf("--");
-  if (idx < 0) return line;
-  return line.slice(0, idx);
+  // stripLuaStrings() already truncates at the first `--` outside a string
+  // literal (and drops string bodies), so its return value is exactly the
+  // code portion of the line — which is what the keyword/brace counters that
+  // call this want. The previous implementation looked for "--" in that
+  // already-stripped text, never found it, and so returned the ORIGINAL line
+  // unchanged — leaving comment text (e.g. `-- TODO: if (...)`) in place and
+  // causing findOnStartEquipRange to miscount `if`/`end` keywords inside
+  // comments. That made it fail to find an existing OnStartEquip and append a
+  // duplicate instead of replacing it.
+  return stripLuaStrings(line);
 }
 
 function findMatchingBrace(lines, openLine) {
@@ -3948,7 +3953,15 @@ function applyEntries(sourceText, yamlItems, logFn, options) {
     const isCard = lubTypeHere === "card";
     const expectedCount = statArraySize(lubTypeHere);
     const newStatArr = buildStatArray(item, lubTypeHere);
-    const needsStat = !isCard || newStatArr.some(v => v !== 0);
+    // A card needs a Stat block ONLY if it has a real defensive value (DEF in
+    // slot 0). buildStatArray() always sets the slot-10 "is equippable" flag,
+    // so the old `newStatArr.some(v => v !== 0)` test was ALWAYS true for cards
+    // — the drop branch below could never fire. The kRO client rejects a card
+    // whose only non-zero slot is that flag with "invalid 'Stat' table(count:
+    // 0)", so such cards must have the Stat field omitted entirely. Armor and
+    // weapons always keep their Stat (they genuinely need the flag).
+    const cardHasDef = (parseInt(item.Defense || 0, 10) || 0) !== 0;
+    const needsStat = !isCard || cardHasDef;
     const statRange = findStatRange(lines, spanS, spanE);
     const statCount = countStatEntries(lines, statRange);
     if (isCard && !needsStat && statRange) {
