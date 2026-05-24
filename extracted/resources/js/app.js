@@ -3194,8 +3194,16 @@ function buildFullEntry(item) {
   // Everything else (including costumes) needs the full Stat per
   // statArraySize(lubType) with the "is equippable" flag set — see
   // buildStatArray() for the per-type slot conventions.
+  //
+  // NOTE: buildStatArray() always sets the slot-10 "is equippable" flag, so a
+  // `statArr.every(v => v === 0)` test is ALWAYS false for cards and would
+  // never drop the Stat field — the kRO client then rejects the card (whose
+  // only non-zero slot is that flag) with "invalid 'Stat' table(count: 0)".
+  // Mirror the modify path's logic: a card needs Stat only when it has a real
+  // defensive value (DEF in slot 0).
   const statArr = buildStatArray(item, lubType);
-  const skipStat = lubType === "card" && statArr.every(v => v === 0);
+  const cardHasDef = (parseInt(item.Defense || 0, 10) || 0) !== 0;
+  const skipStat = lubType === "card" && !cardHasDef;
   if (!skipStat) {
     lines.push(`    Stat = ${formatStatArray(statArr)},`);
   }
