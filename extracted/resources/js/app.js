@@ -950,6 +950,10 @@ function normaliseHerculesBonusLine(raw) {
 
 function splitArgs(argstr) {
   const out = [];
+  // No-arg flag bonuses (`bonus bName;`) leave the args capture group
+  // undefined; coerce to a string so iteration below doesn't throw.
+  if (argstr == null) return out;
+  argstr = String(argstr);
   let buf = "";
   let depth = 0;
   for (const ch of argstr) {
@@ -4256,8 +4260,27 @@ function parseItemDbText(text) {
       .filter(h => (h.Script && h.Script.trim()) || (h.OnEquipScript && h.OnEquipScript.trim()))
       .map(normalizeHerculesItem);
   }
-  const data = jsyaml.load(text);
+  const data = loadItemYamlTolerant(text);
   return (data && data.Body) || [];
+}
+
+// js-yaml's default loader throws on the first duplicate mapping key, which
+// aborts the entire DB. Real-world item_db override files often have a stray
+// repeated key (e.g. `View:` listed twice in one item). Parse strictly first;
+// if the only problem is a duplicated key, retry in JSON-compatible mode where
+// the last value wins — matching how the server itself would resolve it — and
+// warn so the user can fix the source.
+function loadItemYamlTolerant(text) {
+  try {
+    return jsyaml.load(text);
+  } catch (e) {
+    const isDup = e && (e.reason === "duplicated mapping key" ||
+                        /duplicated mapping key/i.test(e.message || ""));
+    if (!isDup) throw e;
+    const where = e.mark ? ` near line ${e.mark.line + 1}` : "";
+    log(`  ! Duplicate key in YAML${where} — using the last value (please fix the source).`);
+    return jsyaml.load(text, { json: true });
+  }
 }
 
 document.getElementById("run").onclick = async () => {
