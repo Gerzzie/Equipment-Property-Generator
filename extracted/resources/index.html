@@ -54,10 +54,15 @@
           </div>
         </div>
       </div>
-      <div class="row">
-        <label for="combo" id="combo-label">Item Combo</label>
-        <input id="combo" type="text" spellcheck="false" placeholder="(optional)" />
-        <button id="browse-combo" type="button">Browse…</button>
+      <div class="row row-multi-db">
+        <label id="combo-label">Item Combos</label>
+        <div class="db-stack">
+          <div class="db-list" id="combo-list"></div>
+          <div class="db-stack-foot">
+            <span class="db-hint">Optional. All combo files are merged — order doesn't matter.</span>
+            <button id="add-combo" type="button">+ Add Combo</button>
+          </div>
+        </div>
       </div>
     </section>
 

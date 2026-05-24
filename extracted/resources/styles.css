@@ -870,8 +870,14 @@ button.primary {
   font-size: 11px;
   font-style: italic;
 }
-#add-db {
+#add-db,
+#add-combo {
   height: 26px;
   padding: 0 12px;
   font-size: 12px;
+}
+/* Combo rows reuse the DB-row look but have no priority number or reorder
+   arrows — every combo file is merged equally, so order is irrelevant. */
+.combo-row {
+  grid-template-columns: 1fr auto auto;
 }

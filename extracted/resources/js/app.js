@@ -13,7 +13,6 @@ const DEFAULT_SOURCE_LUB =
 
 // ----- DOM handles -----
 const $src = document.getElementById("src");
-const $combo = document.getElementById("combo");
 const $log = document.getElementById("log");
 const $status = document.getElementById("status");
 const $statusbar = document.querySelector(".statusbar");
@@ -36,6 +35,23 @@ try {
 
 function saveItemDbs() {
   try { localStorage.setItem("item_dbs", JSON.stringify(ITEM_DBS)); } catch {}
+}
+
+// ----- Item combo file list state -----
+// `COMBO_DBS` is an array of combo-file path strings. Unlike ITEM_DBS there is
+// no priority ordering — every combo file is parsed and its sets are merged
+// together (an item appearing in more than one set gets all its set IDs).
+// Persisted to localStorage under "combo_dbs".
+let COMBO_DBS = [""];
+try {
+  const saved = JSON.parse(localStorage.getItem("combo_dbs") || "null");
+  if (Array.isArray(saved) && saved.length) {
+    COMBO_DBS = saved.map(x => typeof x === "string" ? x : "");
+  }
+} catch {}
+
+function saveComboDbs() {
+  try { localStorage.setItem("combo_dbs", JSON.stringify(COMBO_DBS)); } catch {}
 }
 
 function log(msg) {
@@ -83,7 +99,7 @@ function setFormatMode(mode, notify = true) {
   const lbl = document.getElementById("yml-label");
   if (lbl) lbl.textContent = mode === "hercules" ? "Input CONFs" : "Input YAMLs";
   const comboLbl = document.getElementById("combo-label");
-  if (comboLbl) comboLbl.textContent = mode === "hercules" ? "Item Combo CONF" : "Item Combo YAML";
+  if (comboLbl) comboLbl.textContent = mode === "hercules" ? "Item Combo CONFs" : "Item Combo YAMLs";
   if (notify) {
     toast(mode === "hercules"
       ? "Successfully switched to Hercules"
@@ -102,7 +118,7 @@ const SESSION_KEY = "last_session";
 function getSession() {
   return {
     src: $src.value,
-    combo: $combo.value,
+    combo_dbs: COMBO_DBS.slice(),
     item_dbs: ITEM_DBS.slice(),
     format_mode: FORMAT_MODE,
   };
@@ -115,7 +131,17 @@ function autosaveSession() {
 function applySession(s) {
   if (!s || typeof s !== "object") return;
   if (typeof s.src === "string")   $src.value   = s.src;
-  if (typeof s.combo === "string") $combo.value = s.combo;
+  if (Array.isArray(s.combo_dbs)) {
+    COMBO_DBS = s.combo_dbs.map(x => typeof x === "string" ? x : "");
+    if (!COMBO_DBS.length) COMBO_DBS = [""];
+    saveComboDbs();
+    renderComboList();
+  } else if (typeof s.combo === "string") {
+    // Legacy session: a single combo path → migrate it into the list.
+    COMBO_DBS = [s.combo];
+    saveComboDbs();
+    renderComboList();
+  }
   if (Array.isArray(s.item_dbs)) {
     ITEM_DBS = s.item_dbs.map(x => typeof x === "string" ? x : "");
     if (!ITEM_DBS.length) ITEM_DBS = [""];
@@ -128,21 +154,28 @@ function applySession(s) {
   autosaveSession();
 }
 
-// Restore src/combo from the last session on launch. ITEM_DBS / FORMAT_MODE
-// are already restored above from their own localStorage keys, so we only
-// override the two text inputs that don't otherwise persist.
+// Restore src from the last session on launch. COMBO_DBS / ITEM_DBS /
+// FORMAT_MODE are already restored above from their own localStorage keys, so
+// we only override the src text input that doesn't otherwise persist.
 try {
   const saved = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
   if (saved && typeof saved === "object") {
-    if (typeof saved.src === "string"   && saved.src)   $src.value   = saved.src;
-    if (typeof saved.combo === "string" && saved.combo) $combo.value = saved.combo;
+    if (typeof saved.src === "string" && saved.src) $src.value = saved.src;
+    // Legacy migration: older builds stored a single `combo` path in the
+    // session. If the dedicated combo_dbs key hasn't been written yet, seed
+    // the new list from it so upgrading users keep their combo file.
+    if (typeof saved.combo === "string" && saved.combo &&
+        localStorage.getItem("combo_dbs") == null) {
+      COMBO_DBS = [saved.combo];
+      saveComboDbs();
+    }
   }
 } catch {}
 
-// Bump autosave whenever src / combo are edited so the next launch reflects
-// the latest paths even if the user never explicitly saves.
-$src.addEventListener("input",   autosaveSession);
-$combo.addEventListener("input", autosaveSession);
+// Bump autosave whenever src is edited so the next launch reflects the latest
+// path even if the user never explicitly saves. (Combo / DB list edits
+// autosave through their own list handlers.)
+$src.addEventListener("input", autosaveSession);
 
 // ============================================================================
 // Bonus translation
@@ -4182,25 +4215,15 @@ document.getElementById("browse-src").onclick = async () => {
     [{ name: "Lua/Lub files", extensions: ["lub", "lua"] }, { name: "All files", extensions: ["*"] }]);
   if (p) $src.value = p;
 };
-// (multi-DB picker is wired in setupDbList() below)
-document.getElementById("browse-combo").onclick = async () => {
-  const filters = FORMAT_MODE === "hercules"
-    ? [{ name: "Hercules item_combo_db", extensions: ["conf", "txt"] }, { name: "All files", extensions: ["*"] }]
-    : [{ name: "rAthena item_combos YAML", extensions: ["yml", "yaml"] }, { name: "All files", extensions: ["*"] }];
-  const title = FORMAT_MODE === "hercules"
-    ? "Select Hercules item_combo_db.conf"
-    : "Select rAthena item_combos.yml";
-  const p = await pickFile(title, filters);
-  if (p) $combo.value = p;
-};
-
+// (multi-DB picker is wired in setupDbList() below; multi-combo picker in
+// setupComboList())
 
 document.getElementById("clear-log").onclick = () => { $log.textContent = ""; };
 
 document.getElementById("new-session").onclick = async () => {
   const hasContent =
     ($src.value || "").trim() ||
-    ($combo.value || "").trim() ||
+    COMBO_DBS.some(p => (p || "").trim()) ||
     ITEM_DBS.some(p => (p || "").trim());
   if (hasContent) {
     const res = await Neutralino.os.showMessageBox(
@@ -4211,7 +4234,9 @@ document.getElementById("new-session").onclick = async () => {
     if (res !== "YES") return;
   }
   $src.value = "";
-  $combo.value = "";
+  COMBO_DBS = [""];
+  saveComboDbs();
+  renderComboList();
   ITEM_DBS = [""];
   saveItemDbs();
   renderDbList();
@@ -4422,19 +4447,28 @@ document.getElementById("run").onclick = async () => {
     //   4. attach the chosen set_ids to each member item's Combo field
     // applyEntries() then writes them as Combiitem = { set_id, ... } and
     // appends the queued global entries to the bottom-of-file Combiitem table.
-    const comboPath = $combo.value.trim();
+    const comboPaths = COMBO_DBS.map(p => (p || "").trim()).filter(Boolean);
     let pendingCombiEntries = [];   // { setId, partnerIds, script } to append
-    if (comboPath) {
-      try {
-        log(`Reading combo DB: ${comboPath}`);
-        const comboText = await Neutralino.filesystem.readFile(comboPath);
-        let comboSets;
-        if (FORMAT_MODE === "hercules") {
-          comboSets = parseHerculesComboDb(comboText);
-        } else {
-          comboSets = parseRathenaComboDb(jsyaml.load(comboText));
+    if (comboPaths.length) {
+      // Read every combo file and merge their sets into one list. Each file is
+      // read in its own try/catch so a single unreadable/malformed file only
+      // warns and is skipped rather than aborting the others.
+      let comboSets = [];
+      for (const comboPath of comboPaths) {
+        try {
+          log(`Reading combo DB: ${comboPath}`);
+          const comboText = await Neutralino.filesystem.readFile(comboPath);
+          const fileSets = FORMAT_MODE === "hercules"
+            ? parseHerculesComboDb(comboText)
+            : parseRathenaComboDb(jsyaml.load(comboText));
+          log(`  Parsed ${fileSets.length} combo set(s).`);
+          comboSets = comboSets.concat(fileSets);
+        } catch (e) {
+          log(`Warning: could not load combo DB "${comboPath}" - ${e.message || e}`);
         }
-        log(`Parsed ${comboSets.length} combo set(s).`);
+      }
+      if (comboSets.length) try {
+        log(`Parsed ${comboSets.length} combo set(s) total from ${comboPaths.length} file(s).`);
         const aegisToId = new Map();
         for (const item of body) {
           if (item.AegisName && item.Id != null) aegisToId.set(item.AegisName, parseInt(item.Id, 10));
@@ -4491,7 +4525,7 @@ document.getElementById("run").onclick = async () => {
         log(`Linked ${injected} item(s) to combo set IDs.`);
         log(`Reused ${setIdToMembers.size - queuedEntries.length} existing combo set(s); ${queuedEntries.length} new combo set(s) to append.`);
       } catch (e) {
-        log(`Warning: could not load combo DB - ${e.message || e}`);
+        log(`Warning: could not process combo data - ${e.message || e}`);
       }
     }
 
@@ -4971,6 +5005,87 @@ function dbBrowseTitle() {
       ITEM_DBS[ITEM_DBS.length - 1] = picked;
       saveItemDbs(); renderDbList();
     }
+  });
+})();
+
+// ============================================================================
+// Item combo file list — UI rendering and event wiring
+// ============================================================================
+// Mirrors the Item DB list but without priority/reorder controls: every combo
+// file is parsed and merged equally, so order doesn't matter.
+function renderComboList() {
+  const list = document.getElementById("combo-list");
+  if (!list) return;
+  list.innerHTML = "";
+  COMBO_DBS.forEach((pathVal, idx) => {
+    const row = document.createElement("div");
+    row.className = "db-row combo-row";
+    row.dataset.idx = String(idx);
+    row.innerHTML =
+      `<input class="db-path" type="text" spellcheck="false" placeholder="(optional)" value="${escapeHtml(pathVal || "")}" />` +
+      `<button class="db-btn db-browse" title="Browse…" type="button">…</button>` +
+      `<button class="db-btn db-remove" title="Remove"  type="button" ${COMBO_DBS.length === 1 ? "disabled" : ""}>×</button>`;
+    list.appendChild(row);
+  });
+}
+
+function comboBrowseFilters() {
+  return FORMAT_MODE === "hercules"
+    ? [{ name: "Hercules item_combo_db", extensions: ["conf", "txt"] }, { name: "All files", extensions: ["*"] }]
+    : [{ name: "rAthena item_combos YAML", extensions: ["yml", "yaml"] }, { name: "All files", extensions: ["*"] }];
+}
+function comboBrowseTitle() {
+  return FORMAT_MODE === "hercules"
+    ? "Select Hercules item_combo_db.conf"
+    : "Select rAthena item_combos.yml";
+}
+
+(function setupComboList() {
+  const list = document.getElementById("combo-list");
+  const addBtn = document.getElementById("add-combo");
+  if (!list || !addBtn) return;
+
+  renderComboList();
+
+  list.addEventListener("click", async (e) => {
+    const btn = e.target.closest(".db-btn");
+    if (!btn) return;
+    const row = btn.closest(".db-row");
+    if (!row) return;
+    const idx = parseInt(row.dataset.idx, 10);
+    if (btn.classList.contains("db-remove") && COMBO_DBS.length > 1) {
+      COMBO_DBS.splice(idx, 1);
+      saveComboDbs(); renderComboList(); autosaveSession();
+    } else if (btn.classList.contains("db-browse")) {
+      const picked = await pickFile(comboBrowseTitle(), comboBrowseFilters());
+      if (picked) {
+        COMBO_DBS[idx] = picked;
+        saveComboDbs(); renderComboList(); autosaveSession();
+      }
+    }
+  });
+
+  list.addEventListener("input", (e) => {
+    const inp = e.target.closest(".db-path");
+    if (!inp) return;
+    const row = inp.closest(".db-row");
+    if (!row) return;
+    const idx = parseInt(row.dataset.idx, 10);
+    COMBO_DBS[idx] = inp.value;
+    saveComboDbs(); autosaveSession();
+  });
+
+  addBtn.addEventListener("click", async () => {
+    // Add a new empty slot, then immediately invite the user to pick a file.
+    // If they cancel, the empty slot remains so they can paste a path manually.
+    COMBO_DBS.push("");
+    saveComboDbs(); renderComboList();
+    const picked = await pickFile(comboBrowseTitle(), comboBrowseFilters());
+    if (picked) {
+      COMBO_DBS[COMBO_DBS.length - 1] = picked;
+      saveComboDbs(); renderComboList();
+    }
+    autosaveSession();
   });
 })();
 
