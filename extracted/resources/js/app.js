@@ -373,20 +373,18 @@ const AUTOSPELL_PROBE_ID_POOL = (() => {
   }
   return pool;
 })();
-const dynamicProbes = new Map();          // probe key -> { key, extParamId, name, div, count }
+const dynamicProbes = new Map();          // probe key -> { key, extParamId, name, div?, count? }
 
 // Reset per-run state. Call once at the start of each Apply, before scanning.
 function resetDynamicProbes() { dynamicProbes.clear(); }
 
-// Probe key for an item+mode combined auto-cast line. itemKey = String(item.Id)
-// for items, or "combo<setId>" for combos. mode "" = on attack, "hit" = when hit.
-function itemAutospellKey(itemKey, mode) {
-  return "auto:" + itemKey + ":" + mode;
-}
+// Per-item auto-cast probe key. ONE id per item (mode "all" combines both the
+// on-attack and when-hit auto-cast skills into a single baked-label entry).
+function itemAutospellKey(itemKey, mode) { return "auto:" + itemKey + ":" + mode; }
 
-// Allocate the next free ext-param id: confirmed pool first, then the uncertain
-// pool, skipping any id already used by PROBE_ENTRIES or an existing dynamic
-// entry. Returns null on exhaustion.
+// Allocate the next free ext-param id for an auto-cast probe: prefer the
+// confirmed pool, then the spare pool, skipping ids already used by static
+// probes or previously allocated dynamic probes this run. null = pool exhausted.
 function allocAutospellId() {
   const used = new Set([
     ...PROBE_ENTRIES.map(e => e.extParamId),
@@ -402,15 +400,15 @@ function allocAutospellId() {
 // AND bonus4 (the 4-arg form adds a trailing BF_* trigger flag we ignore).
 const AUTOSPELL_SCAN_RE = /\bbAutoSpell(WhenHit)?\b\s*,\s*"?([A-Za-z_]\w*|\d+)"?\s*,\s*(\d+)/gi;
 
-// Register ONE combined auto-cast Order line per (item, mode). Scans scriptText,
-// groups matches by mode, resolves skill ids (skipping unresolved), and for each
-// mode with ≥1 skill allocates ONE id and builds the combined label. Deterministic
-// (source order, dedupe identical skill+level within an item+mode). Returns
-// [{ itemKey, mode, extParamId|null, count, skills }] for logging.
-function registerItemAutospell(itemKey, scriptText) {
-  const result = [];
-  if (!scriptText) return result;
-  // Group skill labels by mode in source order.
+// Pure scan of bAutoSpell / bAutoSpellWhenHit lines in a rAthena item script.
+// Resolves skill ids (skipping unresolved), dedupes skill+level within a mode,
+// and returns per-mode friendly skill label lists in deterministic source order.
+// Shared by BOTH the ext-param probe path (registerItemAutospell) and the item
+// DESCRIPTION path (buildAutocastDescLines) so the two always agree on the skill
+// list/naming. Returns { onAttack: [labels], whenHit: [labels], count }.
+function scanAutospellParts(scriptText) {
+  const out = { onAttack: [], whenHit: [], count: 0 };
+  if (!scriptText) return out;
   const byMode = new Map();   // mode -> { labels: [], seen: Set }
   let m;
   AUTOSPELL_SCAN_RE.lastIndex = 0;
@@ -427,38 +425,259 @@ function registerItemAutospell(itemKey, scriptText) {
     g.seen.add(dedupKey);
     g.labels.push(friendlySkill(tok) + " Lv" + level);
   }
-  // Deterministic mode order: on-attack ("") before when-hit ("hit").
-  for (const mode of ["", "hit"]) {
-    const g = byMode.get(mode);
-    if (!g || !g.labels.length) continue;
-    const key = itemAutospellKey(itemKey, mode);
-    const count = g.labels.length;
-    const list = g.labels.join(", ");
-    const id = allocAutospellId();
-    if (id == null) {
-      result.push({ itemKey, mode, extParamId: null, count, skills: list });
-      continue;                                    // pool exhausted → line dropped
-    }
-    const name = mode === "hit"
-      ? `Random chance to auto-cast when hit ({val} effects): ${list}`
-      : `Random chance to auto-cast on attack ({val} effects): ${list}`;
-    dynamicProbes.set(key, { key, extParamId: id, name, div: 1, count });
-    result.push({ itemKey, mode, extParamId: id, count, skills: list });
+  out.onAttack = (byMode.get("") || { labels: [] }).labels;
+  out.whenHit = (byMode.get("hit") || { labels: [] }).labels;
+  out.count = out.onAttack.length + out.whenHit.length;
+  return out;
+}
+
+// Register an item/combo's auto-cast skills as ONE per-item baked-label probe
+// (mode "all" combines both on-attack and when-hit). Allocates a single
+// ext-param id whose Order entry's name BAKES IN the skill list, and routes
+// {val} = the COUNT of skills so the client renders a numeric value (it shows
+// BLANK for value-less "presence" entries). Returns
+// [{ itemKey, mode, extParamId, count, skills }] for logging (extParamId null =
+// pool exhausted → line dropped). itemKey = String(item.Id) or "combo<setId>".
+function registerItemAutospell(itemKey, scriptText) {
+  const result = [];
+  if (!scriptText) return result;
+  const scan = scanAutospellParts(scriptText);
+  const parts = [];
+  const count = scan.count;
+  if (scan.onAttack.length) parts.push("on attack: " + scan.onAttack.join(", "));
+  if (scan.whenHit.length) parts.push("when hit: " + scan.whenHit.join(", "));
+  if (!parts.length) return result;
+  const key = itemAutospellKey(itemKey, "all");
+  const id = allocAutospellId();
+  if (id == null) {
+    result.push({ itemKey, mode: "all", extParamId: null, count, skills: parts.join("; ") });
+    return result;
   }
+  const name = `Random chance to auto-cast ({val} effects) — ${parts.join("; ")}`;
+  dynamicProbes.set(key, { key, extParamId: id, name, div: 1, count });
+  result.push({ itemKey, mode: "all", extParamId: id, count, skills: parts.join("; ") });
   return result;
 }
 
-// Emit the combined AddExtParam call(s) for an item/combo's auto-cast lines, one
-// per mode that was registered. itemKey = String(item.Id) or "combo<setId>".
-// Returns an array of Lua call strings (empty when none registered).
+// Emit the AddExtParam call for an item/combo's combined auto-cast probe.
+// One call per item; the value = the effect COUNT (so the Order entry's {val}
+// renders a number). itemKey = String(item.Id) or "combo<setId>".
 function autospellCallsFor(itemKey) {
-  const out = [];
-  for (const mode of ["", "hit"]) {
-    const e = dynamicProbes.get(itemAutospellKey(itemKey, mode));
-    if (e) out.push(`AddExtParam(0, ${e.extParamId}, ${e.count})`);
+  const e = dynamicProbes.get(itemAutospellKey(itemKey, "all"));
+  return e ? [`AddExtParam(0, ${e.extParamId}, ${e.count})`] : [];
+}
+
+// -----------------------------------------------------------------------------
+// PRIMARY auto-cast display: item DESCRIPTION text (kRO itemInfo.lua).
+//
+// The ext-param probe above is limited by the client's renderable id pool. The
+// item DESCRIPTION (identifiedDescriptionName) has NO per-item limit and no
+// stat-bonus risk, so it's the PRIMARY channel; the ext-param probe is only a
+// FALLBACK for items whose description couldn't be written (file absent, or the
+// item id not present in the itemInfo table).
+//
+// Description filename candidates, tried in order in the source .lub's dir.
+const ITEMINFO_FILENAME = ["itemInfo.lua", "itemInfo.lub", "iteminfo.lua"];
+// Recognizable prefix marking lines WE injected, so re-running Apply strips the
+// old lines first and never duplicates. (A Lua --[[comment]] is not valid inside
+// a quoted-string array element, so we track by this visible text prefix.)
+const AUTOCAST_DESC_PREFIX = "[Auto-Cast]";
+// Optional kRO color code for the injected lines (^RRGGBB … ^000000 reset).
+const AUTOCAST_DESC_COLOR = "aa00aa";
+
+// Build the description line(s) for one item's auto-cast effects from a script.
+// Returns an array of plain strings (already prefixed with AUTOCAST_DESC_PREFIX
+// and wrapped in a color code), e.g.:
+//   "[Auto-Cast] ^aa00aaRandom chance to auto-cast on attack: Fire Ball Lv1.^000000"
+// Empty array when the item has no resolvable auto-cast skills.
+function buildAutocastDescLines(scriptText) {
+  const scan = scanAutospellParts(scriptText);
+  const lines = [];
+  const wrap = (txt) => `${AUTOCAST_DESC_PREFIX} ^${AUTOCAST_DESC_COLOR}${txt}^000000`;
+  if (scan.onAttack.length) {
+    lines.push(wrap("Random chance to auto-cast on attack: " + scan.onAttack.join(", ") + "."));
+  }
+  if (scan.whenHit.length) {
+    lines.push(wrap("Random chance to auto-cast when hit: " + scan.whenHit.join(", ") + "."));
+  }
+  return lines;
+}
+
+// Escape a JS string for embedding inside a Lua double-quoted string literal.
+function luaEscape(s) {
+  return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+// PURE injector (no filesystem) — testable directly with a string.
+//
+// `fileText`   : contents of a kRO itemInfo.lua table file.
+// `descById`   : Map/object of itemId(number|string) -> [descLine, …] (the
+//                already-built AUTOCAST_DESC_PREFIX lines from buildAutocastDescLines).
+// Appends each item's auto-cast description line(s) into that item's
+// `identifiedDescriptionName = { … }` array, just before its closing `}`.
+// IDEMPOTENT: any existing AUTOCAST_DESC_PREFIX line for that item is stripped
+// first, so re-running never duplicates. Items not found in the file are
+// reported in `result.missing`.
+// Returns { text, writtenIds:Set, missing:[ids], changed:bool }.
+function injectAutocastDescriptions(fileText, descById) {
+  const result = { text: fileText, writtenIds: new Set(), missing: [], changed: false };
+  // Normalize descById into [key, value] pairs. Duck-type for Map (works across
+  // realms / vm contexts where `instanceof Map` would fail).
+  const entries = (descById && typeof descById.entries === "function")
+    ? [...descById.entries()]
+    : Object.entries(descById || {});
+  let text = fileText;
+
+  for (const [rawId, descLinesIn] of entries) {
+    const id = String(rawId);
+    const descLines = Array.isArray(descLinesIn) ? descLinesIn : [];
+    if (!descLines.length) continue;
+
+    // Find the item's table block: `[<id>] = {` … matching `}`. We don't need a
+    // full Lua parser — locate the identifiedDescriptionName array within the
+    // item's block and edit just that array.
+    // 1) Anchor on `[<id>] =` (allow optional surrounding whitespace).
+    const idAnchor = new RegExp("\\[\\s*" + id + "\\s*\\]\\s*=\\s*\\{", "g");
+    const am = idAnchor.exec(text);
+    if (!am) { result.missing.push(id); continue; }
+
+    // 2) Within the item block, find `identifiedDescriptionName = {` and its
+    //    matching closing `}` (the first `}` at the same brace depth).
+    const blockStart = am.index + am[0].length;
+    const descKeyRe = /identifiedDescriptionName\s*=\s*\{/g;
+    descKeyRe.lastIndex = blockStart;
+    const dm = descKeyRe.exec(text);
+    if (!dm) { result.missing.push(id); continue; }
+
+    const arrStart = dm.index + dm[0].length;   // just after the opening `{`
+    // Scan forward for the matching close brace of THIS array.
+    let depth = 1, i = arrStart, inStr = false, strCh = "";
+    for (; i < text.length && depth > 0; i++) {
+      const ch = text[i];
+      if (inStr) {
+        if (ch === "\\") { i++; continue; }       // skip escaped char
+        if (ch === strCh) inStr = false;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { inStr = true; strCh = ch; continue; }
+      if (ch === "{") depth++;
+      else if (ch === "}") depth--;
+    }
+    if (depth !== 0) { result.missing.push(id); continue; }   // malformed — skip
+    const arrEnd = i - 1;                        // index of the matching `}`
+
+    // 3) Strip any prior AUTOCAST_DESC_PREFIX line(s) inside this array, then
+    //    append the fresh lines just before the closing `}`.
+    let arrBody = text.slice(arrStart, arrEnd);
+    // Remove existing injected entries: lines like  "[Auto-Cast] …",
+    const stripRe = new RegExp(
+      "\\n?[ \\t]*\"" + AUTOCAST_DESC_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[^\"]*\"\\s*,?",
+      "g"
+    );
+    arrBody = arrBody.replace(stripRe, "");
+
+    // Determine indentation from existing entries (default two tabs).
+    const indentMatch = arrBody.match(/\n([ \t]+)"/);
+    const indent = indentMatch ? indentMatch[1] : "\t\t";
+    // Ensure the body ends with a newline before we append our lines.
+    let appended = arrBody.replace(/\s*$/, "");
+    if (appended.length) appended += "\n";
+    for (const line of descLines) {
+      appended += indent + '"' + luaEscape(line) + '",\n';
+    }
+    // Re-indent the closing brace to match the array's own indentation if known.
+    const closeIndent = indent.replace(/[ \t]$/, "");   // one level shallower-ish
+    appended += closeIndent;
+
+    text = text.slice(0, arrStart) + appended + text.slice(arrEnd);
+    result.writtenIds.add(id);
+    result.changed = true;
+  }
+
+  result.text = text;
+  return result;
+}
+
+// Locate the itemInfo description file beside the source .lub and append each
+// auto-cast item's description line(s) into its identifiedDescriptionName array.
+// Backs up the file (.bak) before writing, mirroring patchOrderFiles. Uses the
+// pure injectAutocastDescriptions() so the parsing/idempotency is unit-testable.
+//
+// `descById` : Map<itemId, [descLine, …]> built from buildAutocastDescLines.
+// Returns { written:0|N, found:bool, writtenIds:Set, path|null }.
+async function patchItemDescriptions(srcLubPath, descById, logFn) {
+  const log = typeof logFn === "function" ? logFn : () => {};
+  const out = { written: 0, found: false, writtenIds: new Set(), path: null };
+  if (!srcLubPath) return out;
+  const sep = srcLubPath.includes("\\") ? "\\" : "/";
+  const dir = srcLubPath.split(/[\\\/]/).slice(0, -1).join(sep);
+  if (!dir) return out;
+
+  // Find the description file by reading the source dir and matching any of the
+  // ITEMINFO_FILENAME candidates case-insensitively (some patchers lowercase).
+  let entries = [];
+  try { entries = await Neutralino.filesystem.readDirectory(dir); }
+  catch { entries = []; }
+  let foundName = null;
+  // Prefer the candidate order in ITEMINFO_FILENAME.
+  for (const cand of ITEMINFO_FILENAME) {
+    const hit = entries.find(e => e.type === "FILE" && e.entry.toLowerCase() === cand.toLowerCase());
+    if (hit) { foundName = hit.entry; break; }
+  }
+  if (!foundName) {
+    log(`Item descriptions: item-description file not found next to source — auto-cast will fall back to ext-param slots; put your itemInfo.lua (tried ${ITEMINFO_FILENAME.join(", ")}) beside the source .lub to enable descriptions.`);
+    return out;
+  }
+  out.found = true;
+  const path = dir + sep + foundName;
+  out.path = path;
+
+  let fileText;
+  try { fileText = await Neutralino.filesystem.readFile(path); }
+  catch (e) {
+    log(`Item descriptions: could not read ${path} — ${e.message || e}; falling back to ext-param slots.`);
+    out.found = false;
+    return out;
+  }
+
+  const res = injectAutocastDescriptions(fileText, descById);
+  out.writtenIds = res.writtenIds;
+  out.written = res.writtenIds.size;
+
+  // Per-item warnings for ids present in descById but not found in the file.
+  for (const id of res.missing) {
+    log(`Item descriptions: item ${id} not found in ${foundName} — add it there (or it will use the ext-param fallback).`);
+  }
+
+  if (res.changed && res.text !== fileText) {
+    try {
+      await Neutralino.filesystem.writeFile(path + ".pre-rdl-autocast.bak", fileText);
+      await Neutralino.filesystem.writeFile(path, res.text);
+      log(`Item descriptions: wrote auto-cast lines for ${out.written} item(s) into ${foundName} (backup: ${foundName}.pre-rdl-autocast.bak).`);
+    } catch (e) {
+      log(`Item descriptions: write failed for ${path} — ${e.message || e}; those items fall back to ext-param slots.`);
+      out.written = 0;
+      out.writtenIds = new Set();
+    }
+  } else if (out.found) {
+    if (out.written) log(`Item descriptions: ${foundName} already up-to-date for ${out.written} auto-cast item(s).`);
+    else log(`Item descriptions: no matching auto-cast items found in ${foundName}.`);
   }
   return out;
 }
+
+// Test hook (Node harness only): expose pure functions for unit testing without
+// the browser/Neutralino runtime. No effect in the app.
+try {
+  if (typeof globalThis !== "undefined") {
+    globalThis.__T = Object.assign(globalThis.__T || {}, {
+      injectAutocastDescriptions,
+      buildAutocastDescLines,
+      scanAutospellParts,
+      patchItemDescriptions,
+    });
+  }
+} catch {}
 
 // -----------------------------------------------------------------------------
 // Fallback: rAthena bonus name -> EnumVAR field (for bonuses without a known
@@ -4403,6 +4622,8 @@ const RDL_CB_STUBS_BEGIN   = "-- RDL custom-bonus stubs BEGIN (auto-generated fr
 const RDL_CB_STUBS_END     = "-- RDL custom-bonus stubs END";
 const RDL_PROBE_BEGIN      = "-- RDL probe entry BEGIN (Max Weight via spare ext-param id)";
 const RDL_PROBE_END        = "-- RDL probe entry END";
+const RDL_ACNAMES_BEGIN    = "-- RDL auto-cast names BEGIN (skill id -> name, for GetAutoCastName)";
+const RDL_ACNAMES_END      = "-- RDL auto-cast names END";
 
 function escapeRegExpLocal(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -4577,6 +4798,14 @@ function injectMaxWeightProbe(text) {
   return { text: out, added: entries.length };
 }
 
+// NEUTRALIZED: the shared-slot auto-cast trick (which needed an embedded
+// GetAutoCastName name table) was reverted to per-item baked-label probes, so
+// this injection is no longer needed. Kept as a no-op (returns text unchanged)
+// so the now-unused RDL_AUTOCAST_NAMES / GetAutoCastName block is never emitted.
+function injectAutocastNames(text) {
+  return { text, added: 0 };
+}
+
 // Layer the auto-generated custom-bonus stubs + Order entries onto an
 // already-RDL-patched Order file. Idempotent: strips any prior custom block
 // first, then regenerates. Returns { text, added, skipped }.
@@ -4611,7 +4840,10 @@ function injectCustomBonusOrder(text) {
 function injectDynamicOrderEntries(text) {
   const probe = injectMaxWeightProbe(text);
   const cb = injectCustomBonusOrder(probe.text);
-  return { text: cb.text, added: probe.added + cb.added, skipped: cb.skipped };
+  // injectAutocastNames is now a no-op (the shared-slot GetAutoCastName trick
+  // was reverted to per-item baked-label probes); kept in the chain harmlessly.
+  const ac = injectAutocastNames(cb.text);
+  return { text: ac.text, added: probe.added + cb.added + ac.added, skipped: cb.skipped };
 }
 
 // Write a fresh EquipmentPropertiesOrder.lub from the bundled template
@@ -5459,25 +5691,56 @@ document.getElementById("run").onclick = async () => {
     } catch {}
     for (const e of pendingCombiEntries) validSetIds.add(e.setId);
 
-    // Pre-scan every item/combo script for auto-cast skills and allocate ONE
-    // probe ext-param id per (ITEM, MODE) BEFORE the Order file is written — so
-    // the injected Order entries and the OnStartEquip calls agree on ids. One
-    // combined line per item+mode (lists every auto-cast skill) keeps id demand
-    // low on the limited-id Project 255 client.
+    // Auto-cast display strategy (two-channel):
+    //   PRIMARY  — item DESCRIPTION text (itemInfo.lua), no per-item limit, no
+    //              stat-bonus risk. Written first; the set of item ids we manage
+    //              to write becomes "covered by description".
+    //   FALLBACK — the ext-param probe (one id per item) for everything NOT
+    //              covered by a description (file absent, or item id not in the
+    //              itemInfo table). Static probes (maxweight/frozen/addeff) are
+    //              untouched in all cases.
     resetDynamicProbes();
-    // Scan the rAthena ITEM scripts (where bAutoSpell lives) — NOT sourceText,
-    // which is the kRO .lub being patched and has no rAthena bonus lines.
+
+    // 1) Build per-item auto-cast description lines (numeric item ids only;
+    //    combos have no itemInfo entry). Scan the rAthena ITEM scripts (where
+    //    bAutoSpell lives) — NOT sourceText, the kRO .lub being patched.
+    const descById = new Map();
+    for (const it of body) {
+      const lines = buildAutocastDescLines(collectScriptText(it));
+      if (lines.length) descById.set(String(it.Id), lines);
+    }
+
+    // 2) PRIMARY: write descriptions to itemInfo.lua beside the source. If the
+    //    file is absent, descCovered stays empty → everything uses the fallback
+    //    (zero regression vs. the previous ext-param-only behaviour).
+    let descCovered = new Set();
+    try {
+      const dr = await patchItemDescriptions(effectiveSrc, descById, log);
+      descCovered = dr.writtenIds || new Set();
+    } catch (e) {
+      log(`Item descriptions: error — ${e.message || e}; using ext-param fallback for all auto-cast items.`);
+    }
+
+    // 3) FALLBACK ext-param probes: allocate ONE id per (ITEM, MODE) BEFORE the
+    //    Order file is written — so the injected Order entries and the
+    //    OnStartEquip calls agree on ids. SKIP any item already covered by a
+    //    description so we don't burn an id (and so descriptions win).
     const autoMap = [];
-    for (const it of body) autoMap.push(...registerItemAutospell(String(it.Id), collectScriptText(it)));
+    for (const it of body) {
+      if (descCovered.has(String(it.Id))) continue;   // covered by description → no probe
+      autoMap.push(...registerItemAutospell(String(it.Id), collectScriptText(it)));
+    }
     for (const e of pendingCombiEntries) autoMap.push(...registerItemAutospell("combo" + e.setId, e && e.script));
+    if (descCovered.size) {
+      log(`Auto-cast: ${descCovered.size} item(s) shown via DESCRIPTION (primary); ext-param fallback used only for the rest.`);
+    }
     if (autoMap.length) {
       const wired = autoMap.filter(a => a.extParamId != null).length;
-      log(`Auto-cast lines: ${wired} wired (one combined line per item+mode).`);
+      log(`Auto-cast lines: ${wired} wired, ${autoMap.length - wired} dropped (ext-param id pool exhausted).`);
       for (const a of autoMap) {
-        const where = a.mode === "hit" ? "when hit" : "on attack";
-        const label = `${a.itemKey} (${where}, ${a.count} effect${a.count === 1 ? "" : "s"}): ${a.skills}`;
-        if (a.extParamId != null) log(`  ${label} → ext-param ${a.extParamId} (verify it renders in-client)`);
-        else log(`  ${label} → POOL EXHAUSTED — won't display; extend AUTOSPELL_PROBE_ID_POOL`);
+        const label = `${a.itemKey} (${a.count}): ${a.skills}`;
+        if (a.extParamId != null) log(`  ${label} → ext-param ${a.extParamId}`);
+        else log(`  ${label} → POOL EXHAUSTED (won't display)`);
       }
     }
 
