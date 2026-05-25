@@ -5794,10 +5794,6 @@ document.getElementById("about").onclick = () => {
 document.getElementById("about-close").onclick = () => {
   document.getElementById("about-modal").classList.remove("show");
 };
-document.getElementById("about-open-site").onclick = async () => {
-  try { await Neutralino.os.open("https://ragnarokdeveloperslounge.com/"); }
-  catch (e) { log("Could not open website: " + (e.message || e)); }
-};
 
 // ---- Menu bar (File / Edit dropdowns) ----
 (function setupMenuBar() {
