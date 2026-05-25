@@ -334,7 +334,8 @@ bonus2:
   bAddEff:            "Has {V/100}% chance of inflicting EFF when attacking."
   bAddEff2:           "Has {V/100}% chance of inflicting EFF on yourself when attacking."
   bAddEffWhenHit:     "Has {V/100}% chance of inflicting EFF on the attacker when hit."
-  bResEff:            "Add a V% resistance against EFF."
+  # bResEff value is in 1/100% units — script `, 5000` = 50% resistance.
+  bResEff:            "Add a {V/100}% resistance against EFF."
   bResEff_imm:        "Gain immunity to EFF."
 
   # Skills (ARG = skill name)

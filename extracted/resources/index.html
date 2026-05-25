@@ -110,6 +110,12 @@
           <code>{arg1}</code>, <code>{arg2}</code>, … as placeholders.
           Example: name <code>bIncreasePogi</code>, args 1,
           lua <code>IncreasePogi({arg1})</code>, description <code>Increase Pogi {arg1}%</code>.
+          <br />
+          On Apply, each rule whose Lua is a single call carrying <code>{arg1}</code>
+          also gets a matching entry in <code>EquipmentPropertiesOrder.lub</code>
+          (with a no-op stub), so the registered value renders in the tooltip.
+          The Description becomes the label — <code>{arg1}</code> shows as the
+          signed value (keeps a trailing <code>%</code>).
         </p>
 
         <div id="cb-list" class="cb-list"></div>

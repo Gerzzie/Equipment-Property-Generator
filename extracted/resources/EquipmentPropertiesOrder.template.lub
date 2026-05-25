@@ -12,19 +12,21 @@
 EnumVAR = EnumVAR or {}
 
 -- ============================================================
---   RDL custom stubs for AutoSpell / AddEff tooltip support
+--   RDL custom stubs for AutoSpell / AddEff / MaxWeight tooltip support
 -- ------------------------------------------------------------
 -- These functions are emitted by EquipmentProperties.lub for proc-based
--- bonuses (autospell on attack/when-hit, status-effect on attack). The
--- stock kRO client has no native handlers for these in the tooltip path —
--- the actual gameplay effect is server-applied — so we stub them out here
--- as no-ops and let the Order entries below render the descriptive text.
+-- bonuses (autospell on attack/when-hit, status-effect on attack) and the
+-- max-weight bonus. Each definition is GUARDED with `if type(...) ~= "function"`
+-- so that on a client that DOES provide a native tooltip recorder we leave it
+-- intact (and the value renders); only on a client that lacks it do we install
+-- a no-op so the property function can't crash. Defining these unconditionally
+-- would shadow a native recorder with a no-op and stop the value displaying.
 -- ============================================================
-function AddAutoSpell(skill_id, level, chance) end
-function AddAutoSpellWhenHit(skill_id, level, chance) end
-function AddEffectOnAttack(effect_id, chance) end
-function AddMaxWeight(amount) end
-function SubMaxWeight(amount) end
+if type(AddAutoSpell) ~= "function" then function AddAutoSpell(skill_id, level, chance) end end
+if type(AddAutoSpellWhenHit) ~= "function" then function AddAutoSpellWhenHit(skill_id, level, chance) end end
+if type(AddEffectOnAttack) ~= "function" then function AddEffectOnAttack(effect_id, chance) end end
+if type(AddMaxWeight) ~= "function" then function AddMaxWeight(amount) end end
+if type(SubMaxWeight) ~= "function" then function SubMaxWeight(amount) end end
 -- GetEffectName: rough fallback lookup used by the AddEffectOnAttack
 -- tooltip entry's `sep` field. Override per-server if a richer effect-name
 -- table is available — return value just needs to be a display string.
@@ -1817,7 +1819,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.MIN] = 0, [ValueOption.MAX] = 100 }
 			},
 			[66] = {
-				name = "{sym}{val}#CRI vs Formless Monster",
+				name = "Additional {sym}{val} Critical on Formless Monster",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.Nothing },
@@ -1826,7 +1828,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[67] = {
-				name = "{sym}{val}#CRI vs Undead Monster",
+				name = "Additional {sym}{val} Critical on Undead Monster",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.Undead },
@@ -1835,7 +1837,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[68] = {
-				name = "{sym}{val}#CRI vs Brute Monster",
+				name = "Additional {sym}{val} Critical on Brute Monster",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.Animal },
@@ -1844,7 +1846,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[69] = {
-				name = "{sym}{val}#CRI vs Plant Monster",
+				name = "Additional {sym}{val} Critical on Plant Monster",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.Plant },
@@ -1853,7 +1855,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[70] = {
-				name = "{sym}{val}#CRI vs Insect Monster",
+				name = "Additional {sym}{val} Critical on Insect Monster",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.Insect },
@@ -1862,7 +1864,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[71] = {
-				name = "{sym}{val}#CRI vs Fish Monster",
+				name = "Additional {sym}{val} Critical on Fish Monster",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.Fish },
@@ -1871,7 +1873,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[72] = {
-				name = "{sym}{val}#CRI vs Demon Monster",
+				name = "Additional {sym}{val} Critical on Demon Monster",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.Demon },
@@ -1880,7 +1882,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[73] = {
-				name = "{sym}{val}#CRI vs DemiHuman Monster",
+				name = "Additional {sym}{val} Critical on DemiHuman Monster",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.Human },
@@ -1889,7 +1891,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[74] = {
-				name = "{sym}{val}#CRI vs Angel Monster",
+				name = "Additional {sym}{val} Critical on Angel Monster",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.Angel },
@@ -1898,7 +1900,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[75] = {
-				name = "{sym}{val}#CRI vs Dragon Monster",
+				name = "Additional {sym}{val} Critical on Dragon Monster",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.Dragon },
@@ -1907,7 +1909,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[76] = {
-				name = "{sym}{val}#CRI vs Human Player",
+				name = "Additional {sym}{val} Critical on Human Player",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.HumanPlayer },
@@ -1916,7 +1918,7 @@ EquipmentPropertiesOrder = {
 				valOpt = { [ValueOption.DIV] = 10, [ValueOption.FLOAT] = 0 }
 			},
 			[77] = {
-				name = "{sym}{val}#CRI vs Doram Player",
+				name = "Additional {sym}{val} Critical on Doram Player",
 				func = FunctionPreset.IncCriByUnitRace,
 				val = { [2] = Operation.ADD },
 				cond = { [1] = Race.DoramPlayer },

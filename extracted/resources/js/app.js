@@ -274,6 +274,193 @@ const EXTPARAM_LITERAL = {
 };
 
 // -----------------------------------------------------------------------------
+// Ext-param "probe" registry  (generalised from the Max Weight probe)
+// -----------------------------------------------------------------------------
+// The Project 255 client only renders tooltip values captured by the NATIVE
+// AddExtParam recorder. Effects with no native recorder (Max Weight, status
+// resistance, on-attack status chance, …) are rescued by routing their value
+// through a SPARE ext-param id — AddExtParam captures any (0, id, V) triple, and
+// an injected Order entry selects the id via `cond = { [1]=0, [2]=id }` and
+// labels it freely (see renderProbeEntry / injectProbeEntries below).
+//
+// RULES (read before adding entries):
+//   - extParamId MUST be UNIQUE per effect. AddExtParam values ACCUMULATE per
+//     id, so two effects sharing an id would sum under one label.
+//   - extParamId MUST be confirmed to render in-client. After Apply, equip a
+//     test item: the label shows "+N" if the id works, a DIFFERENT stat if the
+//     id is a real stat (pick another), or BLANK if the client ignores it.
+//     Verified so far: 250 (Max Weight, confirmed in-game). Verified-FREE in
+//     app.js (untested in-client): 251, 252, 248, 246, 247, 249, 240, 241.
+//   - `div` scales the recorded value for display (Order valOpt DIV); the
+//     translator emits the RAW value, so we never double-scale. div 1 = none.
+//   - `name` is the Order-entry label template ({sym}=+/-, {val}=number).
+//   - keyed by effect: "maxweight", or "<bonus>:<enumId>" (e.g. "reseff:2" =
+//     bResEff Frozen, "addeff:2" = bAddEff Frozen — EFF_FREEZE = 2).
+//
+// PROOF-FIRST rollout: Max Weight (confirmed) + Frozen (resist 251, on-attack
+// 252) + Storm Gust auto-cast (248) are wired. Confirm 251/252/248 render
+// in-client, then add the remaining statuses / scalar bonuses / auto-cast skills
+// here reusing the same machinery.
+const PROBE_ENTRIES = [
+  { key: "maxweight", extParamId: 250, name: "{sym}{val}#Max Weight",                  div: 10  },
+  { key: "reseff:2",  extParamId: 251, name: "{sym}{val}%#Frozen Resistance",          div: 100 },
+  { key: "reseff:1",  extParamId: 247, name: "{sym}{val}%#Stun Resistance",            div: 100 },
+  { key: "reseff:7",  extParamId: 249, name: "{sym}{val}%#Silence Resistance",         div: 100 },
+  { key: "addeff:2",  extParamId: 252, name: "{sym}{val}%#Chance to Freeze on attack", div: 1   },
+  // NOTE: auto-cast skills (bAutoSpell / bAutoSpellWhenHit) are handled by the
+  // DYNAMIC probe system below (one id per skill+level, allocated from the pool
+  // during the Apply pre-scan), not by static entries here.
+];
+const PROBE_BY_KEY = new Map(PROBE_ENTRIES.map(e => [e.key, e]));
+// probeFor() resolves a probe key against BOTH the static PROBE_ENTRIES above
+// and the per-run dynamicProbes map (auto-cast skills allocated by the pre-scan).
+function probeFor(key) { return PROBE_BY_KEY.get(key) || dynamicProbes.get(key) || null; }
+
+// Emit the AddExtParam/SubExtParam call that routes a value through a probe id.
+// `rawValue` is the RAW rAthena value (string or number) — display scaling is
+// done by the Order entry's valOpt, so we never scale here. Passes a non-numeric
+// sentinel (e.g. "__VALUE__") through unchanged for the refine-aware path.
+function emitProbeCall(probe, rawValue) {
+  const num = Number(rawValue);
+  const neg = Number.isFinite(num) && num < 0;
+  return neg
+    ? `SubExtParam(0, ${probe.extParamId}, ${Math.abs(num)})`
+    : `AddExtParam(0, ${probe.extParamId}, ${rawValue})`;
+}
+
+// -----------------------------------------------------------------------------
+// Per-item auto-cast probes — one ext-param id per (ITEM, MODE), NOT per skill.
+//
+// WHY per-item: the Project 255 client only renders a LIMITED number of distinct
+// ext-param ids. The old design allocated one id per (skill, level), so an item
+// with many auto-cast skills exhausted the renderable pool and most lines
+// vanished. Instead we emit ONE combined Order line per (item, mode) that lists
+// every auto-cast skill for that item, using ONE id. This cuts id demand from
+// per-skill to per-item.
+//
+// The combined line still uses the proven {val}+ADD form (FunctionPreset.IncStat
+// + ValuePreset.ExtParam + a {val} token in the name): the client renders BLANK
+// for Operation.ONE "presence" entries with the value baked in, so {val} MUST be
+// present. We route {val} = the COUNT of skills in that line (AddExtParam(0, id,
+// <count>)), so the label reads e.g. "(5 effects): Fire Ball Lv1, …".
+//
+// AUTOSPELL_CONFIRMED_POOL = ext-param ids CONFIRMED to render auto-cast lines on
+// this client (consumed first). AUTOSPELL_PROBE_ID_POOL = uncertain spare ids
+// (each must still be tested in-client). Ids used by PROBE_ENTRIES are skipped
+// automatically. On exhaustion the item's line is dropped (the Apply log lists
+// every item→id mapping and any pool-exhausted warning).
+const AUTOSPELL_CONFIRMED_POOL = [248, 226, 196];
+// MAXIMISED spare-id pool (user opted into the risk). Auto-generated by sweeping
+// a wide range and excluding ONLY the ids we KNOW are real stats (EXTPARAM_LITERAL)
+// plus ids already used by static probes / the confirmed pool. Ordered DESCENDING
+// from the proven-safe neighbourhood (196-248 render in-client) so riskier LOW ids
+// are allocated LAST. ⚠ An id here that is secretly a real client stat (one our
+// table doesn't list) will either render blank OR add a hidden stat bonus to the
+// item — the Apply log prints every item→id mapping so you can spot-check,
+// especially low ids. Raise AUTOSPELL_POOL_MIN_ID to play safer (fewer items
+// covered); lower it to cover more (riskier).
+const AUTOSPELL_POOL_MIN_ID = 20;
+const AUTOSPELL_POOL_MAX_ID = 246;
+const AUTOSPELL_PROBE_ID_POOL = (() => {
+  const exclude = new Set([
+    ...Object.values(EXTPARAM_LITERAL),
+    ...PROBE_ENTRIES.map(e => e.extParamId),
+    ...AUTOSPELL_CONFIRMED_POOL,
+  ]);
+  const pool = [];
+  for (let id = AUTOSPELL_POOL_MAX_ID; id >= AUTOSPELL_POOL_MIN_ID; id--) {
+    if (!exclude.has(id)) pool.push(id);
+  }
+  return pool;
+})();
+const dynamicProbes = new Map();          // probe key -> { key, extParamId, name, div, count }
+
+// Reset per-run state. Call once at the start of each Apply, before scanning.
+function resetDynamicProbes() { dynamicProbes.clear(); }
+
+// Probe key for an item+mode combined auto-cast line. itemKey = String(item.Id)
+// for items, or "combo<setId>" for combos. mode "" = on attack, "hit" = when hit.
+function itemAutospellKey(itemKey, mode) {
+  return "auto:" + itemKey + ":" + mode;
+}
+
+// Allocate the next free ext-param id: confirmed pool first, then the uncertain
+// pool, skipping any id already used by PROBE_ENTRIES or an existing dynamic
+// entry. Returns null on exhaustion.
+function allocAutospellId() {
+  const used = new Set([
+    ...PROBE_ENTRIES.map(e => e.extParamId),
+    ...[...dynamicProbes.values()].map(e => e.extParamId),
+  ]);
+  for (const id of AUTOSPELL_CONFIRMED_POOL) if (!used.has(id)) return id;
+  for (const id of AUTOSPELL_PROBE_ID_POOL) if (!used.has(id)) return id;
+  return null;
+}
+
+// Scan bAutoSpell / bAutoSpellWhenHit lines. Captures: [1] "WhenHit" or undef
+// (mode), [2] skill token (numeric id or aegis name), [3] level. Handles bonus3
+// AND bonus4 (the 4-arg form adds a trailing BF_* trigger flag we ignore).
+const AUTOSPELL_SCAN_RE = /\bbAutoSpell(WhenHit)?\b\s*,\s*"?([A-Za-z_]\w*|\d+)"?\s*,\s*(\d+)/gi;
+
+// Register ONE combined auto-cast Order line per (item, mode). Scans scriptText,
+// groups matches by mode, resolves skill ids (skipping unresolved), and for each
+// mode with ≥1 skill allocates ONE id and builds the combined label. Deterministic
+// (source order, dedupe identical skill+level within an item+mode). Returns
+// [{ itemKey, mode, extParamId|null, count, skills }] for logging.
+function registerItemAutospell(itemKey, scriptText) {
+  const result = [];
+  if (!scriptText) return result;
+  // Group skill labels by mode in source order.
+  const byMode = new Map();   // mode -> { labels: [], seen: Set }
+  let m;
+  AUTOSPELL_SCAN_RE.lastIndex = 0;
+  while ((m = AUTOSPELL_SCAN_RE.exec(scriptText)) !== null) {
+    const mode = m[1] ? "hit" : "";
+    const tok = m[2];
+    const level = m[3];
+    const skillId = /^\d+$/.test(tok) ? parseInt(tok, 10) : resolveSkillId(tok);
+    if (skillId == null) continue;                 // unresolved skill → skip
+    if (!byMode.has(mode)) byMode.set(mode, { labels: [], seen: new Set() });
+    const g = byMode.get(mode);
+    const dedupKey = skillId + ":" + level;
+    if (g.seen.has(dedupKey)) continue;            // dedupe skill+level in this item+mode
+    g.seen.add(dedupKey);
+    g.labels.push(friendlySkill(tok) + " Lv" + level);
+  }
+  // Deterministic mode order: on-attack ("") before when-hit ("hit").
+  for (const mode of ["", "hit"]) {
+    const g = byMode.get(mode);
+    if (!g || !g.labels.length) continue;
+    const key = itemAutospellKey(itemKey, mode);
+    const count = g.labels.length;
+    const list = g.labels.join(", ");
+    const id = allocAutospellId();
+    if (id == null) {
+      result.push({ itemKey, mode, extParamId: null, count, skills: list });
+      continue;                                    // pool exhausted → line dropped
+    }
+    const name = mode === "hit"
+      ? `Random chance to auto-cast when hit ({val} effects): ${list}`
+      : `Random chance to auto-cast on attack ({val} effects): ${list}`;
+    dynamicProbes.set(key, { key, extParamId: id, name, div: 1, count });
+    result.push({ itemKey, mode, extParamId: id, count, skills: list });
+  }
+  return result;
+}
+
+// Emit the combined AddExtParam call(s) for an item/combo's auto-cast lines, one
+// per mode that was registered. itemKey = String(item.Id) or "combo<setId>".
+// Returns an array of Lua call strings (empty when none registered).
+function autospellCallsFor(itemKey) {
+  const out = [];
+  for (const mode of ["", "hit"]) {
+    const e = dynamicProbes.get(itemAutospellKey(itemKey, mode));
+    if (e) out.push(`AddExtParam(0, ${e.extParamId}, ${e.count})`);
+  }
+  return out;
+}
+
+// -----------------------------------------------------------------------------
 // Fallback: rAthena bonus name -> EnumVAR field (for bonuses without a known
 // literal ID). These still load cleanly because EnumVAR is a runtime global,
 // but the tooltip scanner won't pick them up — they won't display in-game.
@@ -502,7 +689,16 @@ const BONUS_TRANSLATORS = {
   bracetolerance:   (_n, a) => a.length === 2 ? emitE(raceEnum(a[0]), r => `AddRaceTolerace(${r}, ${a[1]})`) : null,
   bmagicaddrace:    (_n, a) => a.length === 2 ? emitE(raceEnum(a[0]), r => `AddMdamage_Race(${r}, ${a[1]})`) : null,
   bmagicaddrace2:   (_n, a) => a.length === 2 ? [] : null,
-  bcriticaladdrace: (_n, a) => a.length === 2 ? emitE(raceEnum(a[0]), r => `AddCRIPercent_Race(${r}, ${a[1]})`) : null,
+  // CRI-vs-race renders via Order entries [66]+ which divide the value by 10
+  // (valOpt DIV=10), so a raw 7 would display as 0 and the line is suppressed.
+  // Emit value*10 so the intended crit shows (e.g. 7 -> AddCRIPercent_Race(r,70)
+  // -> "+7"). Non-numeric values fall back to raw.
+  bcriticaladdrace: (_n, a) => {
+    if (a.length !== 2) return null;
+    const n = Number(a[1]);
+    const v = isSafeNumericLiteral(a[1]) && Number.isFinite(n) ? Math.round(n * 10) : a[1];
+    return emitE(raceEnum(a[0]), r => `AddCRIPercent_Race(${r}, ${v})`);
+  },
   bexpaddrace:      (_n, a) => a.length === 2 ? emitE(raceEnum(a[0]), r => `AddEXPPercent_KillRace(${r}, ${a[1]})`) : null,
   bignoredefrace:        (_n, a) => a.length === 1 ? emitE(raceEnum(a[0]), r => `SetIgnoreDEFRace(${r})`) : null,
   bignoredefracerate:    (_n, a) => a.length === 2 ? emitE(raceEnum(a[0]), r => `SetIgnoreDefRace_Percent(${r}, ${a[1]})`) : null,
@@ -535,10 +731,17 @@ const BONUS_TRANSLATORS = {
   bignoremdefele: (_n, a) => a.length === 1 ? emitE(eleEnum(a[0]), e => `SetIgnoreMdefElement(${e})`) : null,
 
   // --- Size-based bonus2 ---
-  baddsize:      (_n, a) => a.length === 2 ? emitE(sizeEnum(a[0]), s => `AddDamage_Size(${s}, ${a[1]})`) : null,
-  bsubsize:      (_n, a) => a.length === 2 ? emitE(sizeEnum(a[0]), s => `SubDamage_Size(${s}, ${a[1]})`) : null,
-  bmagicaddsize: (_n, a) => a.length === 2 ? emitE(sizeEnum(a[0]), s => `AddMDamage_Size(${s}, ${a[1]})`) : null,
-  bmagicsubsize: (_n, a) => a.length === 2 ? emitE(sizeEnum(a[0]), s => `SubMDamage_Size(${s}, ${a[1]})`) : null,
+  // kRO size functions take THREE args: (unit, size, value). `unit` is
+  // Unit.Target (1) for damage you DEAL to that size, Unit.User (0) for damage
+  // you RECEIVE from it. The EquipmentPropertiesOrder Combat entries declare
+  // `cond = { [1] = Unit.X, [2] = Size.Y }` / `val = { [3] = ... }`, i.e. the
+  // tooltip scanner reads the value from argument #3 — so the 2-arg
+  // `(size, value)` form has no arg to match and the line silently never
+  // renders (the bug behind SubDamage_Size(1,15) not showing up).
+  baddsize:      (_n, a) => a.length === 2 ? emitE(sizeEnum(a[0]), s => `AddDamage_Size(1, ${s}, ${a[1]})`) : null,
+  bsubsize:      (_n, a) => a.length === 2 ? emitE(sizeEnum(a[0]), s => `SubDamage_Size(0, ${s}, ${a[1]})`) : null,
+  bmagicaddsize: (_n, a) => a.length === 2 ? emitE(sizeEnum(a[0]), s => `AddMDamage_Size(1, ${s}, ${a[1]})`) : null,
+  bmagicsubsize: (_n, a) => a.length === 2 ? emitE(sizeEnum(a[0]), s => `SubMDamage_Size(0, ${s}, ${a[1]})`) : null,
 
   // --- Reflect (server-applied; client emits a literal call so the
   //     tooltip scanner picks up the value the player will see) ---
@@ -572,6 +775,20 @@ for (const k of Object.keys(SIMPLE_EXT_PARAM)) {
     return [];
   };
 }
+
+// bCritAtkRate is "Critical Damage +V%", which kRO renders through the Combat
+// section's "Critical Damage" entry (AddDamage_CRI / SubDamage_CRI) — NOT the
+// "C.Rate" ext-param slot (253) the SIMPLE_EXT_PARAM auto-wiring above assigned.
+// That Combat entry is cond={[1]=Unit.Target(=1)}, val={[2]} with no DIV, so we
+// emit a literal Unit.Target of 1 and the raw value. Override the auto-wiring.
+BONUS_TRANSLATORS["bcritatkrate"] = (_n, a) => {
+  if (a.length !== 1) return null;
+  if (!isSafeNumericLiteral(a[0])) return null;
+  const num = Number(a[0]);
+  return (Number.isFinite(num) && num < 0)
+    ? `SubDamage_CRI(1, ${Math.abs(num)})`
+    : `AddDamage_CRI(1, ${a[0]})`;
+};
 
 // ---------------------------------------------------------------------------
 // Description-only bonuses (full rAthena item_bonus.txt coverage)
@@ -751,48 +968,284 @@ for (const [key, [addFn, subFn]] of Object.entries(SIGNED_TOOLTIP_CALLS)) {
 // to load. Skill-ID resolution order:
 //   1. SKILL_AEGIS_TO_ID (populated by loadSkillDb from skillid.lub —
 //      either the user's local copy or the bundled template).
-//   2. BUILTIN_SKILL_IDS (this table — covers the ~100 most-used skills).
+//   2. BUILTIN_SKILL_IDS (this table — covers ALL skills from skill_db.yml).
 //   3. Caller drops the call entirely (description-only fallback).
 // In practice (1) almost always wins since the template ships with every
 // build; this table only matters if the bundle itself is corrupted.
 const BUILTIN_SKILL_IDS = {
-  // Novice
-  NV_BASIC: 1, NV_FIRSTAID: 142, NV_TRICKDEAD: 143,
-  // Swordsman
-  SM_SWORD: 2, SM_TWOHAND: 3, SM_RECOVERY: 4, SM_BASH: 5,
-  SM_PROVOKE: 6, SM_MAGNUM: 7, SM_ENDURE: 8,
-  // Mage
-  MG_SRECOVERY: 9, MG_SIGHT: 10, MG_NAPALMBEAT: 11, MG_SAFETYWALL: 12,
-  MG_SOULSTRIKE: 13, MG_COLDBOLT: 14, MG_FROSTDIVER: 15, MG_STONECURSE: 16,
-  MG_FIREBALL: 17, MG_FIREWALL: 18, MG_FIREBOLT: 19, MG_LIGHTNINGBOLT: 20,
-  MG_THUNDERSTORM: 21,
-  // Acolyte
-  AL_DP: 22, AL_DEMONBANE: 23, AL_RUWACH: 24, AL_PNEUMA: 25,
-  AL_TELEPORT: 26, AL_WARP: 27, AL_HEAL: 28, AL_INCAGI: 29,
-  AL_DECAGI: 30, AL_HOLYWATER: 31, AL_CRUCIS: 32, AL_ANGELUS: 33,
-  AL_BLESSING: 34, AL_CURE: 35,
-  // Merchant
-  MC_INCCARRY: 36, MC_DISCOUNT: 37, MC_OVERCHARGE: 38, MC_PUSHCART: 39,
-  MC_IDENTIFY: 40, MC_VENDING: 41, MC_MAMMONITE: 42,
-  // Archer
-  AC_OWL: 43, AC_VULTURE: 44, AC_CONCENTRATION: 45, AC_DOUBLE: 46,
-  AC_SHOWER: 47,
-  // Thief
-  TF_DOUBLE: 48, TF_MISS: 49, TF_STEAL: 50, TF_HIDING: 51,
-  TF_POISON: 52, TF_DETOXIFY: 53,
-  // Knight
-  KN_SPEARMASTERY: 54, KN_PIERCE: 55, KN_BRANDISHSPEAR: 56,
-  KN_SPEARSTAB: 57, KN_SPEARBOOMERANG: 58, KN_TWOHANDQUICKEN: 59,
-  KN_AUTOCOUNTER: 60, KN_BOWLINGBASH: 62, KN_RIDING: 63, KN_CAVALIERMASTERY: 64,
-  // Wizard
-  WZ_FIREPILLAR: 80, WZ_SIGHTRASHER: 81, WZ_METEOR: 83, WZ_JUPITEL: 84,
-  WZ_VERMILION: 85, WZ_WATERBALL: 86, WZ_ICEWALL: 87, WZ_FROSTNOVA: 88,
-  WZ_STORMGUST: 89, WZ_EARTHSPIKE: 90, WZ_HEAVENDRIVE: 91, WZ_QUAGMIRE: 92,
-  WZ_ESTIMATION: 93,
-  // Hunter
-  HT_SKIDTRAP: 117, HT_LANDMINE: 118, HT_ANKLESNARE: 119, HT_SHOCKWAVE: 120,
-  HT_SANDMAN: 121, HT_FLASHER: 122, HT_FREEZINGTRAP: 123, HT_BLASTMINE: 124,
-  HT_CLAYMORETRAP: 125, HT_REMOVETRAP: 126, HT_TALKIEBOX: 127,
+  // Auto-generated from rAthena db/re/skill_db.yml (skill Name -> Id).
+  // 1618 skills — the full server skill list. Regenerate from skill_db.yml
+  // if you update rAthena. Keyed by aegis Name (what `skill "X",N;` uses).
+  NV_BASIC: 1, SM_SWORD: 2, SM_TWOHAND: 3, SM_RECOVERY: 4, SM_BASH: 5, SM_PROVOKE: 6,
+  SM_MAGNUM: 7, SM_ENDURE: 8, MG_SRECOVERY: 9, MG_SIGHT: 10, MG_NAPALMBEAT: 11, MG_SAFETYWALL: 12,
+  MG_SOULSTRIKE: 13, MG_COLDBOLT: 14, MG_FROSTDIVER: 15, MG_STONECURSE: 16, MG_FIREBALL: 17, MG_FIREWALL: 18,
+  MG_FIREBOLT: 19, MG_LIGHTNINGBOLT: 20, MG_THUNDERSTORM: 21, AL_DP: 22, AL_DEMONBANE: 23, AL_RUWACH: 24,
+  AL_PNEUMA: 25, AL_TELEPORT: 26, AL_WARP: 27, AL_HEAL: 28, AL_INCAGI: 29, AL_DECAGI: 30,
+  AL_HOLYWATER: 31, AL_CRUCIS: 32, AL_ANGELUS: 33, AL_BLESSING: 34, AL_CURE: 35, MC_INCCARRY: 36,
+  MC_DISCOUNT: 37, MC_OVERCHARGE: 38, MC_PUSHCART: 39, MC_IDENTIFY: 40, MC_VENDING: 41, MC_MAMMONITE: 42,
+  AC_OWL: 43, AC_VULTURE: 44, AC_CONCENTRATION: 45, AC_DOUBLE: 46, AC_SHOWER: 47, TF_DOUBLE: 48,
+  TF_MISS: 49, TF_STEAL: 50, TF_HIDING: 51, TF_POISON: 52, TF_DETOXIFY: 53, ALL_RESURRECTION: 54,
+  KN_SPEARMASTERY: 55, KN_PIERCE: 56, KN_BRANDISHSPEAR: 57, KN_SPEARSTAB: 58, KN_SPEARBOOMERANG: 59, KN_TWOHANDQUICKEN: 60,
+  KN_AUTOCOUNTER: 61, KN_BOWLINGBASH: 62, KN_RIDING: 63, KN_CAVALIERMASTERY: 64, PR_MACEMASTERY: 65, PR_IMPOSITIO: 66,
+  PR_SUFFRAGIUM: 67, PR_ASPERSIO: 68, PR_BENEDICTIO: 69, PR_SANCTUARY: 70, PR_SLOWPOISON: 71, PR_STRECOVERY: 72,
+  PR_KYRIE: 73, PR_MAGNIFICAT: 74, PR_GLORIA: 75, PR_LEXDIVINA: 76, PR_TURNUNDEAD: 77, PR_LEXAETERNA: 78,
+  PR_MAGNUS: 79, WZ_FIREPILLAR: 80, WZ_SIGHTRASHER: 81, WZ_METEOR: 83, WZ_JUPITEL: 84, WZ_VERMILION: 85,
+  WZ_WATERBALL: 86, WZ_ICEWALL: 87, WZ_FROSTNOVA: 88, WZ_STORMGUST: 89, WZ_EARTHSPIKE: 90, WZ_HEAVENDRIVE: 91,
+  WZ_QUAGMIRE: 92, WZ_ESTIMATION: 93, BS_IRON: 94, BS_STEEL: 95, BS_ENCHANTEDSTONE: 96, BS_ORIDEOCON: 97,
+  BS_DAGGER: 98, BS_SWORD: 99, BS_TWOHANDSWORD: 100, BS_AXE: 101, BS_MACE: 102, BS_KNUCKLE: 103,
+  BS_SPEAR: 104, BS_HILTBINDING: 105, BS_FINDINGORE: 106, BS_WEAPONRESEARCH: 107, BS_REPAIRWEAPON: 108, BS_SKINTEMPER: 109,
+  BS_HAMMERFALL: 110, BS_ADRENALINE: 111, BS_WEAPONPERFECT: 112, BS_OVERTHRUST: 113, BS_MAXIMIZE: 114, HT_SKIDTRAP: 115,
+  HT_LANDMINE: 116, HT_ANKLESNARE: 117, HT_SHOCKWAVE: 118, HT_SANDMAN: 119, HT_FLASHER: 120, HT_FREEZINGTRAP: 121,
+  HT_BLASTMINE: 122, HT_CLAYMORETRAP: 123, HT_REMOVETRAP: 124, HT_TALKIEBOX: 125, HT_BEASTBANE: 126, HT_FALCON: 127,
+  HT_STEELCROW: 128, HT_BLITZBEAT: 129, HT_DETECTING: 130, HT_SPRINGTRAP: 131, AS_RIGHT: 132, AS_LEFT: 133,
+  AS_KATAR: 134, AS_CLOAKING: 135, AS_SONICBLOW: 136, AS_GRIMTOOTH: 137, AS_ENCHANTPOISON: 138, AS_POISONREACT: 139,
+  AS_VENOMDUST: 140, AS_SPLASHER: 141, NV_FIRSTAID: 142, NV_TRICKDEAD: 143, SM_MOVINGRECOVERY: 144, SM_FATALBLOW: 145,
+  SM_AUTOBERSERK: 146, AC_MAKINGARROW: 147, AC_CHARGEARROW: 148, TF_SPRINKLESAND: 149, TF_BACKSLIDING: 150, TF_PICKSTONE: 151,
+  TF_THROWSTONE: 152, MC_CARTREVOLUTION: 153, MC_CHANGECART: 154, MC_LOUD: 155, AL_HOLYLIGHT: 156, MG_ENERGYCOAT: 157,
+  NPC_PIERCINGATT: 158, NPC_MENTALBREAKER: 159, NPC_RANGEATTACK: 160, NPC_ATTRICHANGE: 161, NPC_CHANGEWATER: 162, NPC_CHANGEGROUND: 163,
+  NPC_CHANGEFIRE: 164, NPC_CHANGEWIND: 165, NPC_CHANGEPOISON: 166, NPC_CHANGEHOLY: 167, NPC_CHANGEDARKNESS: 168, NPC_CHANGETELEKINESIS: 169,
+  NPC_CRITICALSLASH: 170, NPC_COMBOATTACK: 171, NPC_GUIDEDATTACK: 172, NPC_SELFDESTRUCTION: 173, NPC_SPLASHATTACK: 174, NPC_SUICIDE: 175,
+  NPC_POISON: 176, NPC_BLINDATTACK: 177, NPC_SILENCEATTACK: 178, NPC_STUNATTACK: 179, NPC_PETRIFYATTACK: 180, NPC_CURSEATTACK: 181,
+  NPC_SLEEPATTACK: 182, NPC_RANDOMATTACK: 183, NPC_WATERATTACK: 184, NPC_GROUNDATTACK: 185, NPC_FIREATTACK: 186, NPC_WINDATTACK: 187,
+  NPC_POISONATTACK: 188, NPC_HOLYATTACK: 189, NPC_DARKNESSATTACK: 190, NPC_TELEKINESISATTACK: 191, NPC_MAGICALATTACK: 192, NPC_METAMORPHOSIS: 193,
+  NPC_PROVOCATION: 194, NPC_SMOKING: 195, NPC_SUMMONSLAVE: 196, NPC_EMOTION: 197, NPC_TRANSFORMATION: 198, NPC_BLOODDRAIN: 199,
+  NPC_ENERGYDRAIN: 200, NPC_KEEPING: 201, NPC_DARKBREATH: 202, NPC_DARKBLESSING: 203, NPC_BARRIER: 204, NPC_DEFENDER: 205,
+  NPC_LICK: 206, NPC_HALLUCINATION: 207, NPC_REBIRTH: 208, NPC_SUMMONMONSTER: 209, RG_SNATCHER: 210, RG_STEALCOIN: 211,
+  RG_BACKSTAP: 212, RG_TUNNELDRIVE: 213, RG_RAID: 214, RG_STRIPWEAPON: 215, RG_STRIPSHIELD: 216, RG_STRIPARMOR: 217,
+  RG_STRIPHELM: 218, RG_INTIMIDATE: 219, RG_GRAFFITI: 220, RG_FLAGGRAFFITI: 221, RG_CLEANER: 222, RG_GANGSTER: 223,
+  RG_COMPULSION: 224, RG_PLAGIARISM: 225, AM_AXEMASTERY: 226, AM_LEARNINGPOTION: 227, AM_PHARMACY: 228, AM_DEMONSTRATION: 229,
+  AM_ACIDTERROR: 230, AM_POTIONPITCHER: 231, AM_CANNIBALIZE: 232, AM_SPHEREMINE: 233, AM_CP_WEAPON: 234, AM_CP_SHIELD: 235,
+  AM_CP_ARMOR: 236, AM_CP_HELM: 237, AM_BIOETHICS: 238, AM_CALLHOMUN: 243, AM_REST: 244, AM_RESURRECTHOMUN: 247,
+  CR_TRUST: 248, CR_AUTOGUARD: 249, CR_SHIELDCHARGE: 250, CR_SHIELDBOOMERANG: 251, CR_REFLECTSHIELD: 252, CR_HOLYCROSS: 253,
+  CR_GRANDCROSS: 254, CR_DEVOTION: 255, CR_PROVIDENCE: 256, CR_DEFENDER: 257, CR_SPEARQUICKEN: 258, MO_IRONHAND: 259,
+  MO_SPIRITSRECOVERY: 260, MO_CALLSPIRITS: 261, MO_ABSORBSPIRITS: 262, MO_TRIPLEATTACK: 263, MO_BODYRELOCATION: 264, MO_DODGE: 265,
+  MO_INVESTIGATE: 266, MO_FINGEROFFENSIVE: 267, MO_STEELBODY: 268, MO_BLADESTOP: 269, MO_EXPLOSIONSPIRITS: 270, MO_EXTREMITYFIST: 271,
+  MO_CHAINCOMBO: 272, MO_COMBOFINISH: 273, SA_ADVANCEDBOOK: 274, SA_CASTCANCEL: 275, SA_MAGICROD: 276, SA_SPELLBREAKER: 277,
+  SA_FREECAST: 278, SA_AUTOSPELL: 279, SA_FLAMELAUNCHER: 280, SA_FROSTWEAPON: 281, SA_LIGHTNINGLOADER: 282, SA_SEISMICWEAPON: 283,
+  SA_DRAGONOLOGY: 284, SA_VOLCANO: 285, SA_DELUGE: 286, SA_VIOLENTGALE: 287, SA_LANDPROTECTOR: 288, SA_DISPELL: 289,
+  SA_ABRACADABRA: 290, SA_MONOCELL: 291, SA_CLASSCHANGE: 292, SA_SUMMONMONSTER: 293, SA_REVERSEORCISH: 294, SA_DEATH: 295,
+  SA_FORTUNE: 296, SA_TAMINGMONSTER: 297, SA_QUESTION: 298, SA_GRAVITY: 299, SA_LEVELUP: 300, SA_INSTANTDEATH: 301,
+  SA_FULLRECOVERY: 302, SA_COMA: 303, BD_ADAPTATION: 304, BD_ENCORE: 305, BD_LULLABY: 306, BD_RICHMANKIM: 307,
+  BD_ETERNALCHAOS: 308, BD_DRUMBATTLEFIELD: 309, BD_RINGNIBELUNGEN: 310, BD_ROKISWEIL: 311, BD_INTOABYSS: 312, BD_SIEGFRIED: 313,
+  BA_MUSICALLESSON: 315, BA_MUSICALSTRIKE: 316, BA_DISSONANCE: 317, BA_FROSTJOKER: 318, BA_WHISTLE: 319, BA_ASSASSINCROSS: 320,
+  BA_POEMBRAGI: 321, BA_APPLEIDUN: 322, DC_DANCINGLESSON: 323, DC_THROWARROW: 324, DC_UGLYDANCE: 325, DC_SCREAM: 326,
+  DC_HUMMING: 327, DC_DONTFORGETME: 328, DC_FORTUNEKISS: 329, DC_SERVICEFORYOU: 330, NPC_RANDOMMOVE: 331, NPC_SPEEDUP: 332,
+  NPC_REVENGE: 333, WE_MALE: 334, WE_FEMALE: 335, WE_CALLPARTNER: 336, ITM_TOMAHAWK: 337, NPC_DARKCROSS: 338,
+  NPC_GRANDDARKNESS: 339, NPC_DARKSTRIKE: 340, NPC_DARKTHUNDER: 341, NPC_STOP: 342, NPC_WEAPONBRAKER: 343, NPC_ARMORBRAKE: 344,
+  NPC_HELMBRAKE: 345, NPC_SHIELDBRAKE: 346, NPC_UNDEADATTACK: 347, NPC_CHANGEUNDEAD: 348, NPC_POWERUP: 349, NPC_AGIUP: 350,
+  NPC_SIEGEMODE: 351, NPC_CALLSLAVE: 352, NPC_INVISIBLE: 353, NPC_RUN: 354, LK_AURABLADE: 355, LK_PARRYING: 356,
+  LK_CONCENTRATION: 357, LK_TENSIONRELAX: 358, LK_BERSERK: 359, LK_FURY: 360, HP_ASSUMPTIO: 361, HP_BASILICA: 362,
+  HP_MEDITATIO: 363, HW_SOULDRAIN: 364, HW_MAGICCRASHER: 365, HW_MAGICPOWER: 366, PA_PRESSURE: 367, PA_SACRIFICE: 368,
+  PA_GOSPEL: 369, CH_PALMSTRIKE: 370, CH_TIGERFIST: 371, CH_CHAINCRUSH: 372, PF_HPCONVERSION: 373, PF_SOULCHANGE: 374,
+  PF_SOULBURN: 375, ASC_KATAR: 376, ASC_EDP: 378, ASC_BREAKER: 379, SN_SIGHT: 380, SN_FALCONASSAULT: 381,
+  SN_SHARPSHOOTING: 382, SN_WINDWALK: 383, WS_MELTDOWN: 384, WS_CREATECOIN: 385, WS_CREATENUGGET: 386, WS_CARTBOOST: 387,
+  WS_SYSTEMCREATE: 388, ST_CHASEWALK: 389, ST_REJECTSWORD: 390, CR_ALCHEMY: 392, CR_SYNTHESISPOTION: 393, CG_ARROWVULCAN: 394,
+  CG_MOONLIT: 395, CG_MARIONETTE: 396, LK_SPIRALPIERCE: 397, LK_HEADCRUSH: 398, LK_JOINTBEAT: 399, HW_NAPALMVULCAN: 400,
+  CH_SOULCOLLECT: 401, PF_MINDBREAKER: 402, PF_MEMORIZE: 403, PF_FOGWALL: 404, PF_SPIDERWEB: 405, ASC_METEORASSAULT: 406,
+  ASC_CDP: 407, WE_BABY: 408, WE_CALLPARENT: 409, WE_CALLBABY: 410, TK_RUN: 411, TK_READYSTORM: 412,
+  TK_STORMKICK: 413, TK_READYDOWN: 414, TK_DOWNKICK: 415, TK_READYTURN: 416, TK_TURNKICK: 417, TK_READYCOUNTER: 418,
+  TK_COUNTER: 419, TK_DODGE: 420, TK_JUMPKICK: 421, TK_HPTIME: 422, TK_SPTIME: 423, TK_POWER: 424,
+  TK_SEVENWIND: 425, TK_HIGHJUMP: 426, SG_FEEL: 427, SG_SUN_WARM: 428, SG_MOON_WARM: 429, SG_STAR_WARM: 430,
+  SG_SUN_COMFORT: 431, SG_MOON_COMFORT: 432, SG_STAR_COMFORT: 433, SG_HATE: 434, SG_SUN_ANGER: 435, SG_MOON_ANGER: 436,
+  SG_STAR_ANGER: 437, SG_SUN_BLESS: 438, SG_MOON_BLESS: 439, SG_STAR_BLESS: 440, SG_DEVIL: 441, SG_FRIEND: 442,
+  SG_KNOWLEDGE: 443, SG_FUSION: 444, SL_ALCHEMIST: 445, AM_BERSERKPITCHER: 446, SL_MONK: 447, SL_STAR: 448,
+  SL_SAGE: 449, SL_CRUSADER: 450, SL_SUPERNOVICE: 451, SL_KNIGHT: 452, SL_WIZARD: 453, SL_PRIEST: 454,
+  SL_BARDDANCER: 455, SL_ROGUE: 456, SL_ASSASIN: 457, SL_BLACKSMITH: 458, BS_ADRENALINE2: 459, SL_HUNTER: 460,
+  SL_SOULLINKER: 461, SL_KAIZEL: 462, SL_KAAHI: 463, SL_KAUPE: 464, SL_KAITE: 465, SL_KAINA: 466,
+  SL_STIN: 467, SL_STUN: 468, SL_SMA: 469, SL_SWOO: 470, SL_SKE: 471, SL_SKA: 472,
+  SM_SELFPROVOKE: 473, NPC_EMOTION_ON: 474, ST_PRESERVE: 475, ST_FULLSTRIP: 476, WS_WEAPONREFINE: 477, CR_SLIMPITCHER: 478,
+  CR_FULLPROTECTION: 479, PA_SHIELDCHAIN: 480, HP_MANARECHARGE: 481, PF_DOUBLECASTING: 482, HW_GANBANTEIN: 483, HW_GRAVITATION: 484,
+  WS_CARTTERMINATION: 485, WS_OVERTHRUSTMAX: 486, CG_HERMODE: 488, CG_TAROTCARD: 489, CR_ACIDDEMONSTRATION: 490, CR_CULTIVATION: 491,
+  ITEM_ENCHANTARMS: 492, TK_MISSION: 493, SL_HIGH: 494, KN_ONEHAND: 495, AM_TWILIGHT1: 496, AM_TWILIGHT2: 497,
+  AM_TWILIGHT3: 498, HT_POWER: 499, GS_GLITTERING: 500, GS_FLING: 501, GS_TRIPLEACTION: 502, GS_BULLSEYE: 503,
+  GS_MADNESSCANCEL: 504, GS_ADJUSTMENT: 505, GS_INCREASING: 506, GS_MAGICALBULLET: 507, GS_CRACKER: 508, GS_SINGLEACTION: 509,
+  GS_SNAKEEYE: 510, GS_CHAINACTION: 511, GS_TRACKING: 512, GS_DISARM: 513, GS_PIERCINGSHOT: 514, GS_RAPIDSHOWER: 515,
+  GS_DESPERADO: 516, GS_GATLINGFEVER: 517, GS_DUST: 518, GS_FULLBUSTER: 519, GS_SPREADATTACK: 520, GS_GROUNDDRIFT: 521,
+  NJ_TOBIDOUGU: 522, NJ_SYURIKEN: 523, NJ_KUNAI: 524, NJ_HUUMA: 525, NJ_ZENYNAGE: 526, NJ_TATAMIGAESHI: 527,
+  NJ_KASUMIKIRI: 528, NJ_SHADOWJUMP: 529, NJ_KIRIKAGE: 530, NJ_UTSUSEMI: 531, NJ_BUNSINJYUTSU: 532, NJ_NINPOU: 533,
+  NJ_KOUENKA: 534, NJ_KAENSIN: 535, NJ_BAKUENRYU: 536, NJ_HYOUSENSOU: 537, NJ_SUITON: 538, NJ_HYOUSYOURAKU: 539,
+  NJ_HUUJIN: 540, NJ_RAIGEKISAI: 541, NJ_KAMAITACHI: 542, NJ_NEN: 543, NJ_ISSEN: 544, SL_DEATHKNIGHT: 572,
+  SL_COLLECTOR: 573, SL_NINJA: 574, SL_GUNNER: 575, NPC_EARTHQUAKE: 653, NPC_FIREBREATH: 654, NPC_ICEBREATH: 655,
+  NPC_THUNDERBREATH: 656, NPC_ACIDBREATH: 657, NPC_DARKNESSBREATH: 658, NPC_DRAGONFEAR: 659, NPC_BLEEDING: 660, NPC_PULSESTRIKE: 661,
+  NPC_HELLJUDGEMENT: 662, NPC_WIDESILENCE: 663, NPC_WIDEFREEZE: 664, NPC_WIDEBLEEDING: 665, NPC_WIDESTONE: 666, NPC_WIDECONFUSE: 667,
+  NPC_WIDESLEEP: 668, NPC_WIDESIGHT: 669, NPC_EVILLAND: 670, NPC_MAGICMIRROR: 671, NPC_SLOWCAST: 672, NPC_CRITICALWOUND: 673,
+  NPC_EXPULSION: 674, NPC_STONESKIN: 675, NPC_ANTIMAGIC: 676, NPC_WIDECURSE: 677, NPC_WIDESTUN: 678, NPC_VAMPIRE_GIFT: 679,
+  NPC_WIDESOULDRAIN: 680, ALL_INCCARRY: 681, NPC_TALK: 682, NPC_HELLPOWER: 683, NPC_WIDEHELLDIGNITY: 684, NPC_INVINCIBLE: 685,
+  NPC_INVINCIBLEOFF: 686, NPC_ALLHEAL: 687, GM_SANDMAN: 688, CASH_BLESSING: 689, CASH_INCAGI: 690, CASH_ASSUMPTIO: 691,
+  ALL_CATCRY: 692, ALL_PARTYFLEE: 693, ALL_ANGEL_PROTECT: 694, ALL_DREAM_SUMMERNIGHT: 695, ALL_REVERSEORCISH: 697, ALL_WEWISH: 698,
+  NPC_VENOMFOG: 706, NPC_MILLENNIUMSHIELD: 707, NPC_COMET: 708, NPC_ICEMINE: 709, NPC_FLAMECROSS: 711, NPC_PULSESTRIKE2: 712,
+  NPC_DANCINGBLADE: 713, NPC_DANCINGBLADE_ATK: 714, NPC_DARKPIERCING: 715, NPC_MAXPAIN: 716, NPC_MAXPAIN_ATK: 717, NPC_DEATHSUMMON: 718,
+  NPC_HELLBURNING: 719, NPC_JACKFROST: 720, NPC_WIDEWEB: 721, NPC_WIDESUCK: 722, NPC_STORMGUST2: 723, NPC_FIRESTORM: 724,
+  NPC_REVERBERATION: 725, NPC_REVERBERATION_ATK: 726, NPC_LEX_AETERNA: 727, NPC_ARROWSTORM: 728, NPC_CHEAL: 729, NPC_SR_CURSEDCIRCLE: 730,
+  NPC_DRAGONBREATH: 731, NPC_FATALMENACE: 732, NPC_MAGMA_ERUPTION: 733, NPC_MAGMA_ERUPTION_DOTDAMAGE: 734, NPC_MANDRAGORA: 735, NPC_PSYCHIC_WAVE: 736,
+  NPC_RAYOFGENESIS: 737, NPC_VENOMIMPRESS: 738, NPC_CLOUD_KILL: 739, NPC_IGNITIONBREAK: 740, NPC_PHANTOMTHRUST: 741, NPC_POISON_BUSTER: 742,
+  NPC_HALLUCINATIONWALK: 743, NPC_ELECTRICWALK: 744, NPC_FIREWALK: 745, NPC_LEASH: 747, NPC_WIDELEASH: 748, NPC_WIDECRITICALWOUND: 749,
+  NPC_ALL_STAT_DOWN: 751, NPC_GRADUAL_GRAVITY: 752, NPC_DAMAGE_HEAL: 753, NPC_IMMUNE_PROPERTY: 754, NPC_MOVE_COORDINATE: 755, NPC_WIDEBLEEDING2: 756,
+  NPC_WIDESILENCE2: 757, NPC_WIDESTUN2: 758, NPC_WIDESTONE2: 759, NPC_WIDESLEEP2: 760, NPC_WIDECURSE2: 761, NPC_WIDECONFUSE2: 762,
+  NPC_WIDEFREEZE2: 763, NPC_BLEEDING2: 764, NPC_ICEBREATH2: 765, NPC_HELLJUDGEMENT2: 768, NPC_RAINOFMETEOR: 769, NPC_GROUNDDRIVE: 770,
+  NPC_RELIEVE_ON: 771, NPC_RELIEVE_OFF: 772, NPC_DEADLYCURSE: 776, NPC_DEADLYCURSE2: 779, NPC_CANE_OF_EVIL_EYE: 780, NPC_KILLING_AURA: 783,
+  ALL_EVENT_20TH_ANNIVERSARY: 784, KN_CHARGEATK: 1001, CR_SHRINK: 1002, AS_SONICACCEL: 1003, AS_VENOMKNIFE: 1004, RG_CLOSECONFINE: 1005,
+  WZ_SIGHTBLASTER: 1006, SA_CREATECON: 1007, SA_ELEMENTWATER: 1008, HT_PHANTASMIC: 1009, BA_PANGVOICE: 1010, DC_WINKCHARM: 1011,
+  BS_UNFAIRLYTRICK: 1012, BS_GREED: 1013, PR_REDEMPTIO: 1014, MO_KITRANSLATION: 1015, MO_BALKYOUNG: 1016, SA_ELEMENTGROUND: 1017,
+  SA_ELEMENTFIRE: 1018, SA_ELEMENTWIND: 1019, RK_ENCHANTBLADE: 2001, RK_SONICWAVE: 2002, RK_DEATHBOUND: 2003, RK_HUNDREDSPEAR: 2004,
+  RK_WINDCUTTER: 2005, RK_IGNITIONBREAK: 2006, RK_DRAGONTRAINING: 2007, RK_DRAGONBREATH: 2008, RK_DRAGONHOWLING: 2009, RK_RUNEMASTERY: 2010,
+  RK_MILLENNIUMSHIELD: 2011, RK_CRUSHSTRIKE: 2012, RK_REFRESH: 2013, RK_GIANTGROWTH: 2014, RK_STONEHARDSKIN: 2015, RK_VITALITYACTIVATION: 2016,
+  RK_STORMBLAST: 2017, RK_FIGHTINGSPIRIT: 2018, RK_ABUNDANCE: 2019, RK_PHANTOMTHRUST: 2020, GC_VENOMIMPRESS: 2021, GC_CROSSIMPACT: 2022,
+  GC_DARKILLUSION: 2023, GC_RESEARCHNEWPOISON: 2024, GC_CREATENEWPOISON: 2025, GC_ANTIDOTE: 2026, GC_POISONINGWEAPON: 2027, GC_WEAPONBLOCKING: 2028,
+  GC_COUNTERSLASH: 2029, GC_WEAPONCRUSH: 2030, GC_VENOMPRESSURE: 2031, GC_POISONSMOKE: 2032, GC_CLOAKINGEXCEED: 2033, GC_PHANTOMMENACE: 2034,
+  GC_HALLUCINATIONWALK: 2035, GC_ROLLINGCUTTER: 2036, GC_CROSSRIPPERSLASHER: 2037, AB_JUDEX: 2038, AB_ANCILLA: 2039, AB_ADORAMUS: 2040,
+  AB_CLEMENTIA: 2041, AB_CANTO: 2042, AB_CHEAL: 2043, AB_EPICLESIS: 2044, AB_PRAEFATIO: 2045, AB_ORATIO: 2046,
+  AB_LAUDAAGNUS: 2047, AB_LAUDARAMUS: 2048, AB_EUCHARISTICA: 2049, AB_RENOVATIO: 2050, AB_HIGHNESSHEAL: 2051, AB_CLEARANCE: 2052,
+  AB_EXPIATIO: 2053, AB_DUPLELIGHT: 2054, AB_DUPLELIGHT_MELEE: 2055, AB_DUPLELIGHT_MAGIC: 2056, AB_SILENTIUM: 2057, WL_WHITEIMPRISON: 2201,
+  WL_SOULEXPANSION: 2202, WL_FROSTMISTY: 2203, WL_JACKFROST: 2204, WL_MARSHOFABYSS: 2205, WL_RECOGNIZEDSPELL: 2206, WL_SIENNAEXECRATE: 2207,
+  WL_RADIUS: 2208, WL_STASIS: 2209, WL_DRAINLIFE: 2210, WL_CRIMSONROCK: 2211, WL_HELLINFERNO: 2212, WL_COMET: 2213,
+  WL_CHAINLIGHTNING: 2214, WL_CHAINLIGHTNING_ATK: 2215, WL_EARTHSTRAIN: 2216, WL_TETRAVORTEX: 2217, WL_TETRAVORTEX_FIRE: 2218, WL_TETRAVORTEX_WATER: 2219,
+  WL_TETRAVORTEX_WIND: 2220, WL_TETRAVORTEX_GROUND: 2221, WL_SUMMONFB: 2222, WL_SUMMONBL: 2223, WL_SUMMONWB: 2224, WL_SUMMON_ATK_FIRE: 2225,
+  WL_SUMMON_ATK_WIND: 2226, WL_SUMMON_ATK_WATER: 2227, WL_SUMMON_ATK_GROUND: 2228, WL_SUMMONSTONE: 2229, WL_RELEASE: 2230, WL_READING_SB: 2231,
+  WL_FREEZE_SP: 2232, RA_ARROWSTORM: 2233, RA_FEARBREEZE: 2234, RA_RANGERMAIN: 2235, RA_AIMEDBOLT: 2236, RA_DETONATOR: 2237,
+  RA_ELECTRICSHOCKER: 2238, RA_CLUSTERBOMB: 2239, RA_WUGMASTERY: 2240, RA_WUGRIDER: 2241, RA_WUGDASH: 2242, RA_WUGSTRIKE: 2243,
+  RA_WUGBITE: 2244, RA_TOOTHOFWUG: 2245, RA_SENSITIVEKEEN: 2246, RA_CAMOUFLAGE: 2247, RA_RESEARCHTRAP: 2248, RA_MAGENTATRAP: 2249,
+  RA_COBALTTRAP: 2250, RA_MAIZETRAP: 2251, RA_VERDURETRAP: 2252, RA_FIRINGTRAP: 2253, RA_ICEBOUNDTRAP: 2254, NC_MADOLICENCE: 2255,
+  NC_BOOSTKNUCKLE: 2256, NC_PILEBUNKER: 2257, NC_VULCANARM: 2258, NC_FLAMELAUNCHER: 2259, NC_COLDSLOWER: 2260, NC_ARMSCANNON: 2261,
+  NC_ACCELERATION: 2262, NC_HOVERING: 2263, NC_F_SIDESLIDE: 2264, NC_B_SIDESLIDE: 2265, NC_MAINFRAME: 2266, NC_SELFDESTRUCTION: 2267,
+  NC_SHAPESHIFT: 2268, NC_EMERGENCYCOOL: 2269, NC_INFRAREDSCAN: 2270, NC_ANALYZE: 2271, NC_MAGNETICFIELD: 2272, NC_NEUTRALBARRIER: 2273,
+  NC_STEALTHFIELD: 2274, NC_REPAIR: 2275, NC_TRAININGAXE: 2276, NC_RESEARCHFE: 2277, NC_AXEBOOMERANG: 2278, NC_POWERSWING: 2279,
+  NC_AXETORNADO: 2280, NC_SILVERSNIPER: 2281, NC_MAGICDECOY: 2282, NC_DISJOINT: 2283, SC_FATALMENACE: 2284, SC_REPRODUCE: 2285,
+  SC_AUTOSHADOWSPELL: 2286, SC_SHADOWFORM: 2287, SC_TRIANGLESHOT: 2288, SC_BODYPAINT: 2289, SC_INVISIBILITY: 2290, SC_DEADLYINFECT: 2291,
+  SC_ENERVATION: 2292, SC_GROOMY: 2293, SC_IGNORANCE: 2294, SC_LAZINESS: 2295, SC_UNLUCKY: 2296, SC_WEAKNESS: 2297,
+  SC_STRIPACCESSARY: 2298, SC_MANHOLE: 2299, SC_DIMENSIONDOOR: 2300, SC_CHAOSPANIC: 2301, SC_MAELSTROM: 2302, SC_BLOODYLUST: 2303,
+  SC_FEINTBOMB: 2304, LG_CANNONSPEAR: 2307, LG_BANISHINGPOINT: 2308, LG_TRAMPLE: 2309, LG_SHIELDPRESS: 2310, LG_REFLECTDAMAGE: 2311,
+  LG_PINPOINTATTACK: 2312, LG_FORCEOFVANGUARD: 2313, LG_RAGEBURST: 2314, LG_SHIELDSPELL: 2315, LG_EXEEDBREAK: 2316, LG_OVERBRAND: 2317,
+  LG_PRESTIGE: 2318, LG_BANDING: 2319, LG_MOONSLASHER: 2320, LG_RAYOFGENESIS: 2321, LG_PIETY: 2322, LG_EARTHDRIVE: 2323,
+  LG_HESPERUSLIT: 2324, LG_INSPIRATION: 2325, SR_DRAGONCOMBO: 2326, SR_SKYNETBLOW: 2327, SR_EARTHSHAKER: 2328, SR_FALLENEMPIRE: 2329,
+  SR_TIGERCANNON: 2330, SR_HELLGATE: 2331, SR_RAMPAGEBLASTER: 2332, SR_CRESCENTELBOW: 2333, SR_CURSEDCIRCLE: 2334, SR_LIGHTNINGWALK: 2335,
+  SR_KNUCKLEARROW: 2336, SR_WINDMILL: 2337, SR_RAISINGDRAGON: 2338, SR_GENTLETOUCH: 2339, SR_ASSIMILATEPOWER: 2340, SR_POWERVELOCITY: 2341,
+  SR_CRESCENTELBOW_AUTOSPELL: 2342, SR_GATEOFHELL: 2343, SR_GENTLETOUCH_QUIET: 2344, SR_GENTLETOUCH_CURE: 2345, SR_GENTLETOUCH_ENERGYGAIN: 2346, SR_GENTLETOUCH_CHANGE: 2347,
+  SR_GENTLETOUCH_REVITALIZE: 2348, WA_SWING_DANCE: 2350, WA_SYMPHONY_OF_LOVER: 2351, WA_MOONLIT_SERENADE: 2352, MI_RUSH_WINDMILL: 2381, MI_ECHOSONG: 2382,
+  MI_HARMONIZE: 2383, WM_LESSON: 2412, WM_METALICSOUND: 2413, WM_REVERBERATION: 2414, WM_REVERBERATION_MELEE: 2415, WM_REVERBERATION_MAGIC: 2416,
+  WM_DOMINION_IMPULSE: 2417, WM_SEVERE_RAINSTORM: 2418, WM_POEMOFNETHERWORLD: 2419, WM_VOICEOFSIREN: 2420, WM_DEADHILLHERE: 2421, WM_LULLABY_DEEPSLEEP: 2422,
+  WM_SIRCLEOFNATURE: 2423, WM_RANDOMIZESPELL: 2424, WM_GLOOMYDAY: 2425, WM_GREAT_ECHO: 2426, WM_SONG_OF_MANA: 2427, WM_DANCE_WITH_WUG: 2428,
+  WM_SOUND_OF_DESTRUCTION: 2429, WM_SATURDAY_NIGHT_FEVER: 2430, WM_LERADS_DEW: 2431, WM_MELODYOFSINK: 2432, WM_BEYOND_OF_WARCRY: 2433, WM_UNLIMITED_HUMMING_VOICE: 2434,
+  SO_FIREWALK: 2443, SO_ELECTRICWALK: 2444, SO_SPELLFIST: 2445, SO_EARTHGRAVE: 2446, SO_DIAMONDDUST: 2447, SO_POISON_BUSTER: 2448,
+  SO_PSYCHIC_WAVE: 2449, SO_CLOUD_KILL: 2450, SO_STRIKING: 2451, SO_WARMER: 2452, SO_VACUUM_EXTREME: 2453, SO_VARETYR_SPEAR: 2454,
+  SO_ARRULLO: 2455, SO_EL_CONTROL: 2456, SO_SUMMON_AGNI: 2457, SO_SUMMON_AQUA: 2458, SO_SUMMON_VENTUS: 2459, SO_SUMMON_TERA: 2460,
+  SO_EL_ACTION: 2461, SO_EL_ANALYSIS: 2462, SO_EL_SYMPATHY: 2463, SO_EL_CURE: 2464, SO_FIRE_INSIGNIA: 2465, SO_WATER_INSIGNIA: 2466,
+  SO_WIND_INSIGNIA: 2467, SO_EARTH_INSIGNIA: 2468, GN_TRAINING_SWORD: 2474, GN_REMODELING_CART: 2475, GN_CART_TORNADO: 2476, GN_CARTCANNON: 2477,
+  GN_CARTBOOST: 2478, GN_THORNS_TRAP: 2479, GN_BLOOD_SUCKER: 2480, GN_SPORE_EXPLOSION: 2481, GN_WALLOFTHORN: 2482, GN_CRAZYWEED: 2483,
+  GN_CRAZYWEED_ATK: 2484, GN_DEMONIC_FIRE: 2485, GN_FIRE_EXPANSION: 2486, GN_FIRE_EXPANSION_SMOKE_POWDER: 2487, GN_FIRE_EXPANSION_TEAR_GAS: 2488, GN_FIRE_EXPANSION_ACID: 2489,
+  GN_HELLS_PLANT: 2490, GN_HELLS_PLANT_ATK: 2491, GN_MANDRAGORA: 2492, GN_SLINGITEM: 2493, GN_CHANGEMATERIAL: 2494, GN_MIX_COOKING: 2495,
+  GN_MAKEBOMB: 2496, GN_S_PHARMACY: 2497, GN_SLINGITEM_RANGEMELEEATK: 2498, AB_SECRAMENT: 2515, WM_SEVERE_RAINSTORM_MELEE: 2516, SR_HOWLINGOFLION: 2517,
+  SR_RIDEINLIGHTNING: 2518, ALL_ODINS_RECALL: 2533, RETURN_TO_ELDICASTES: 2534, ALL_BUYING_STORE: 2535, ALL_GUARDIAN_RECALL: 2536, ALL_ODINS_POWER: 2537,
+  ALL_RAY_OF_PROTECTION: 2543, MC_CARTDECORATE: 2544, RL_RICHS_COIN: 2552, RL_MASS_SPIRAL: 2553, RL_BANISHING_BUSTER: 2554, RL_B_TRAP: 2555,
+  RL_FLICKER: 2556, RL_S_STORM: 2557, RL_E_CHAIN: 2558, RL_QD_SHOT: 2559, RL_C_MARKER: 2560, RL_FIREDANCE: 2561,
+  RL_H_MINE: 2562, RL_P_ALTER: 2563, RL_FALLEN_ANGEL: 2564, RL_R_TRIP: 2565, RL_D_TAIL: 2566, RL_FIRE_RAIN: 2567,
+  RL_HEAT_BARREL: 2568, RL_AM_BLAST: 2569, RL_SLUGSHOT: 2570, RL_HAMMER_OF_GOD: 2571, RL_R_TRIP_PLUSATK: 2572, SJ_LIGHTOFMOON: 2574,
+  SJ_LUNARSTANCE: 2575, SJ_FULLMOONKICK: 2576, SJ_LIGHTOFSTAR: 2577, SJ_STARSTANCE: 2578, SJ_NEWMOONKICK: 2579, SJ_FLASHKICK: 2580,
+  SJ_STAREMPEROR: 2581, SJ_NOVAEXPLOSING: 2582, SJ_UNIVERSESTANCE: 2583, SJ_FALLINGSTAR: 2584, SJ_GRAVITYCONTROL: 2585, SJ_BOOKOFDIMENSION: 2586,
+  SJ_BOOKOFCREATINGSTAR: 2587, SJ_DOCUMENT: 2588, SJ_PURIFY: 2589, SJ_LIGHTOFSUN: 2590, SJ_SUNSTANCE: 2591, SJ_SOLARBURST: 2592,
+  SJ_PROMINENCEKICK: 2593, SJ_FALLINGSTAR_ATK: 2594, SJ_FALLINGSTAR_ATK2: 2595, SP_SOULGOLEM: 2596, SP_SOULSHADOW: 2597, SP_SOULFALCON: 2598,
+  SP_SOULFAIRY: 2599, SP_CURSEEXPLOSION: 2600, SP_SOULCURSE: 2601, SP_SPA: 2602, SP_SHA: 2603, SP_SWHOO: 2604,
+  SP_SOULUNITY: 2605, SP_SOULDIVISION: 2606, SP_SOULREAPER: 2607, SP_SOULREVOLVE: 2608, SP_SOULCOLLECT: 2609, SP_SOULEXPLOSION: 2610,
+  SP_SOULENERGY: 2611, SP_KAUTE: 2612, KO_YAMIKUMO: 3001, KO_RIGHT: 3002, KO_LEFT: 3003, KO_JYUMONJIKIRI: 3004,
+  KO_SETSUDAN: 3005, KO_BAKURETSU: 3006, KO_HAPPOKUNAI: 3007, KO_MUCHANAGE: 3008, KO_HUUMARANKA: 3009, KO_MAKIBISHI: 3010,
+  KO_MEIKYOUSISUI: 3011, KO_ZANZOU: 3012, KO_KYOUGAKU: 3013, KO_JYUSATSU: 3014, KO_KAHU_ENTEN: 3015, KO_HYOUHU_HUBUKI: 3016,
+  KO_KAZEHU_SEIRAN: 3017, KO_DOHU_KOUKAI: 3018, KO_KAIHOU: 3019, KO_ZENKAI: 3020, KO_GENWAKU: 3021, KO_IZAYOI: 3022,
+  KG_KAGEHUMI: 3023, KG_KYOMU: 3024, KG_KAGEMUSYA: 3025, OB_ZANGETSU: 3026, OB_OBOROGENSOU: 3027, OB_OBOROGENSOU_TRANSITION_ATK: 3028,
+  OB_AKAITSUKI: 3029, ECL_SNOWFLIP: 3031, ECL_PEONYMAMY: 3032, ECL_SADAGUI: 3033, ECL_SEQUOIADUST: 3034, ECLAGE_RECALL: 3035,
+  ALL_NIFLHEIM_RECALL: 3041, ALL_PRONTERA_RECALL: 3042, ALL_GLASTHEIM_RECALL: 3043, ALL_THANATOS_RECALL: 3044, ALL_LIGHTHALZEN_RECALL: 3045, GC_DARKCROW: 5001,
+  RA_UNLIMIT: 5002, GN_ILLUSIONDOPING: 5003, RK_DRAGONBREATH_WATER: 5004, RK_LUXANIMA: 5005, NC_MAGMA_ERUPTION: 5006, WM_FRIGG_SONG: 5007,
+  SO_ELEMENTAL_SHIELD: 5008, SR_FLASHCOMBO: 5009, SC_ESCAPE: 5010, AB_OFFERTORIUM: 5011, WL_TELEKINESIS_INTENSE: 5012, LG_KINGS_GRACE: 5013,
+  ALL_FULL_THROTTLE: 5014, NC_MAGMA_ERUPTION_DOTDAMAGE: 5015, SU_BASIC_SKILL: 5018, SU_BITE: 5019, SU_HIDE: 5020, SU_SCRATCH: 5021,
+  SU_STOOP: 5022, SU_LOPE: 5023, SU_SPRITEMABLE: 5024, SU_POWEROFLAND: 5025, SU_SV_STEMSPEAR: 5026, SU_CN_POWDERING: 5027,
+  SU_CN_METEOR: 5028, SU_SV_ROOTTWIST: 5029, SU_SV_ROOTTWIST_ATK: 5030, SU_POWEROFLIFE: 5031, SU_SCAROFTAROU: 5032, SU_PICKYPECK: 5033,
+  SU_PICKYPECK_DOUBLE_ATK: 5034, SU_ARCLOUSEDASH: 5035, SU_LUNATICCARROTBEAT: 5036, SU_POWEROFSEA: 5037, SU_TUNABELLY: 5038, SU_TUNAPARTY: 5039,
+  SU_BUNCHOFSHRIMP: 5040, SU_FRESHSHRIMP: 5041, SU_CN_METEOR2: 5042, SU_LUNATICCARROTBEAT2: 5043, SU_SOULATTACK: 5044, SU_POWEROFFLOCK: 5045,
+  SU_SVG_SPIRIT: 5046, SU_HISS: 5047, SU_NYANGGRASS: 5048, SU_GROOMING: 5049, SU_PURRING: 5050, SU_SHRIMPARTY: 5051,
+  SU_SPIRITOFLIFE: 5052, SU_MEOWMEOW: 5053, SU_SPIRITOFLAND: 5054, SU_CHATTERING: 5055, SU_SPIRITOFSEA: 5056, WE_CALLALLFAMILY: 5063,
+  WE_ONEFOREVER: 5064, WE_CHEERUP: 5065, ALL_EQSWITCH: 5067, CG_SPECIALSINGER: 5068, AB_VITUPERATUM: 5072, AB_CONVENIO: 5073,
+  NV_BREAKTHROUGH: 5075, NV_HELPANGEL: 5076, NV_TRANSCENDENCE: 5077, WL_READING_SB_READING: 5078, DK_SERVANTWEAPON: 5201, DK_SERVANTWEAPON_ATK: 5202,
+  DK_SERVANT_W_SIGN: 5203, DK_SERVANT_W_PHANTOM: 5204, DK_SERVANT_W_DEMOL: 5205, DK_CHARGINGPIERCE: 5206, DK_TWOHANDDEF: 5207, DK_HACKANDSLASHER: 5208,
+  DK_HACKANDSLASHER_ATK: 5209, DK_DRAGONIC_AURA: 5210, DK_MADNESS_CRUSHER: 5211, DK_VIGOR: 5212, DK_STORMSLASH: 5213, AG_DEADLY_PROJECTION: 5214,
+  AG_DESTRUCTIVE_HURRICANE: 5215, AG_RAIN_OF_CRYSTAL: 5216, AG_MYSTERY_ILLUSION: 5217, AG_VIOLENT_QUAKE: 5218, AG_VIOLENT_QUAKE_ATK: 5219, AG_SOUL_VC_STRIKE: 5220,
+  AG_STRANTUM_TREMOR: 5221, AG_ALL_BLOOM: 5222, AG_ALL_BLOOM_ATK: 5223, AG_ALL_BLOOM_ATK2: 5224, AG_CRYSTAL_IMPACT: 5225, AG_CRYSTAL_IMPACT_ATK: 5226,
+  AG_TORNADO_STORM: 5227, AG_TWOHANDSTAFF: 5228, AG_FLORAL_FLARE_ROAD: 5229, AG_ASTRAL_STRIKE: 5230, AG_ASTRAL_STRIKE_ATK: 5231, AG_CLIMAX: 5232,
+  AG_ROCK_DOWN: 5233, AG_STORM_CANNON: 5234, AG_CRIMSON_ARROW: 5235, AG_CRIMSON_ARROW_ATK: 5236, AG_FROZEN_SLASH: 5237, IQ_POWERFUL_FAITH: 5238,
+  IQ_FIRM_FAITH: 5239, IQ_WILL_OF_FAITH: 5240, IQ_OLEUM_SANCTUM: 5241, IQ_SINCERE_FAITH: 5242, IQ_MASSIVE_F_BLASTER: 5243, IQ_EXPOSION_BLASTER: 5244,
+  IQ_FIRST_BRAND: 5245, IQ_FIRST_FAITH_POWER: 5246, IQ_JUDGE: 5247, IQ_SECOND_FLAME: 5248, IQ_SECOND_FAITH: 5249, IQ_SECOND_JUDGEMENT: 5250,
+  IQ_THIRD_PUNISH: 5251, IQ_THIRD_FLAME_BOMB: 5252, IQ_THIRD_CONSECRATION: 5253, IQ_THIRD_EXOR_FLAME: 5254, IG_GUARD_STANCE: 5255, IG_GUARDIAN_SHIELD: 5256,
+  IG_REBOUND_SHIELD: 5257, IG_SHIELD_MASTERY: 5258, IG_SPEAR_SWORD_M: 5259, IG_ATTACK_STANCE: 5260, IG_ULTIMATE_SACRIFICE: 5261, IG_HOLY_SHIELD: 5262,
+  IG_GRAND_JUDGEMENT: 5263, IG_JUDGEMENT_CROSS: 5264, IG_SHIELD_SHOOTING: 5265, IG_OVERSLASH: 5266, IG_CROSS_RAIN: 5267, CD_REPARATIO: 5268,
+  CD_MEDIALE_VOTUM: 5269, CD_MACE_BOOK_M: 5270, CD_ARGUTUS_VITA: 5271, CD_ARGUTUS_TELUM: 5272, CD_ARBITRIUM: 5273, CD_ARBITRIUM_ATK: 5274,
+  CD_PRESENS_ACIES: 5275, CD_FIDUS_ANIMUS: 5276, CD_EFFLIGO: 5277, CD_COMPETENTIA: 5278, CD_PNEUMATICUS_PROCELLA: 5279, CD_DILECTIO_HEAL: 5280,
+  CD_RELIGIO: 5281, CD_BENEDICTUM: 5282, CD_PETITIO: 5283, CD_FRAMEN: 5284, SHC_SHADOW_EXCEED: 5285, SHC_DANCING_KNIFE: 5286,
+  SHC_SAVAGE_IMPACT: 5287, SHC_SHADOW_SENSE: 5288, SHC_ETERNAL_SLASH: 5289, SHC_POTENT_VENOM: 5290, SHC_SHADOW_STAB: 5291, SHC_IMPACT_CRATER: 5292,
+  SHC_ENCHANTING_SHADOW: 5293, SHC_FATAL_SHADOW_CROW: 5294, MT_AXE_STOMP: 5295, MT_RUSH_QUAKE: 5296, MT_M_MACHINE: 5297, MT_A_MACHINE: 5298,
+  MT_D_MACHINE: 5299, MT_TWOAXEDEF: 5300, MT_ABR_M: 5301, MT_SUMMON_ABR_BATTLE_WARIOR: 5302, MT_SUMMON_ABR_DUAL_CANNON: 5303, MT_SUMMON_ABR_MOTHER_NET: 5304,
+  MT_SUMMON_ABR_INFINITY: 5305, AG_DESTRUCTIVE_HURRICANE_CLIMAX: 5306, BO_ACIDIFIED_ZONE_WATER_ATK: 5307, BO_ACIDIFIED_ZONE_GROUND_ATK: 5308, BO_ACIDIFIED_ZONE_WIND_ATK: 5309, BO_ACIDIFIED_ZONE_FIRE_ATK: 5310,
+  ABC_DAGGER_AND_BOW_M: 5311, ABC_MAGIC_SWORD_M: 5312, ABC_STRIP_SHADOW: 5313, ABC_ABYSS_DAGGER: 5314, ABC_UNLUCKY_RUSH: 5315, ABC_CHAIN_REACTION_SHOT: 5316,
+  ABC_FROM_THE_ABYSS: 5317, ABC_ABYSS_SLAYER: 5318, ABC_ABYSS_STRIKE: 5319, ABC_DEFT_STAB: 5320, ABC_ABYSS_SQUARE: 5321, ABC_FRENZY_SHOT: 5322,
+  WH_ADVANCED_TRAP: 5323, WH_WIND_SIGN: 5324, WH_NATUREFRIENDLY: 5325, WH_HAWKRUSH: 5326, WH_HAWK_M: 5327, WH_CALAMITYGALE: 5328,
+  WH_HAWKBOOMERANG: 5329, WH_GALESTORM: 5330, WH_DEEPBLINDTRAP: 5331, WH_SOLIDTRAP: 5332, WH_SWIFTTRAP: 5333, WH_CRESCIVE_BOLT: 5334,
+  WH_FLAMETRAP: 5335, BO_BIONIC_PHARMACY: 5336, BO_BIONICS_M: 5337, BO_THE_WHOLE_PROTECTION: 5338, BO_ADVANCE_PROTECTION: 5339, BO_ACIDIFIED_ZONE_WATER: 5340,
+  BO_ACIDIFIED_ZONE_GROUND: 5341, BO_ACIDIFIED_ZONE_WIND: 5342, BO_ACIDIFIED_ZONE_FIRE: 5343, BO_WOODENWARRIOR: 5344, BO_WOODEN_FAIRY: 5345, BO_CREEPER: 5346,
+  BO_RESEARCHREPORT: 5347, BO_HELLTREE: 5348, TR_STAGE_MANNER: 5349, TR_RETROSPECTION: 5350, TR_MYSTIC_SYMPHONY: 5351, TR_KVASIR_SONATA: 5352,
+  TR_ROSEBLOSSOM: 5353, TR_ROSEBLOSSOM_ATK: 5354, TR_RHYTHMSHOOTING: 5355, TR_METALIC_FURY: 5356, TR_SOUNDBLEND: 5357, TR_GEF_NOCTURN: 5358,
+  TR_ROKI_CAPRICCIO: 5359, TR_AIN_RHAPSODY: 5360, TR_MUSICAL_INTERLUDE: 5361, TR_JAWAII_SERENADE: 5362, TR_NIPELHEIM_REQUIEM: 5363, TR_PRON_MARCH: 5364,
+  EM_MAGIC_BOOK_M: 5365, EM_SPELL_ENCHANTING: 5366, EM_ACTIVITY_BURN: 5367, EM_INCREASING_ACTIVITY: 5368, EM_DIAMOND_STORM: 5369, EM_LIGHTNING_LAND: 5370,
+  EM_VENOM_SWAMP: 5371, EM_CONFLAGRATION: 5372, EM_TERRA_DRIVE: 5373, EM_ELEMENTAL_SPIRIT_M: 5374, EM_SUMMON_ELEMENTAL_ARDOR: 5375, EM_SUMMON_ELEMENTAL_DILUVIO: 5376,
+  EM_SUMMON_ELEMENTAL_PROCELLA: 5377, EM_SUMMON_ELEMENTAL_TERREMOTUS: 5378, EM_SUMMON_ELEMENTAL_SERPENS: 5379, EM_ELEMENTAL_BUSTER: 5380, EM_ELEMENTAL_VEIL: 5381, ABC_CHAIN_REACTION_SHOT_ATK: 5382,
+  ABC_FROM_THE_ABYSS_ATK: 5383, BO_WOODEN_THROWROCK: 5384, BO_WOODEN_ATTACK: 5385, BO_HELL_HOWLING: 5386, BO_HELL_DUSTY: 5387, BO_FAIRY_DUSTY: 5388,
+  EM_ELEMENTAL_BUSTER_FIRE: 5389, EM_ELEMENTAL_BUSTER_WATER: 5390, EM_ELEMENTAL_BUSTER_WIND: 5391, EM_ELEMENTAL_BUSTER_GROUND: 5392, EM_ELEMENTAL_BUSTER_POISON: 5393, NW_P_F_I: 5401,
+  NW_GRENADE_MASTERY: 5402, NW_INTENSIVE_AIM: 5403, NW_GRENADE_FRAGMENT: 5404, NW_THE_VIGILANTE_AT_NIGHT: 5405, NW_ONLY_ONE_BULLET: 5406, NW_SPIRAL_SHOOTING: 5407,
+  NW_MAGAZINE_FOR_ONE: 5408, NW_WILD_FIRE: 5409, NW_BASIC_GRENADE: 5410, NW_HASTY_FIRE_IN_THE_HOLE: 5411, NW_GRENADES_DROPPING: 5412, NW_AUTO_FIRING_LAUNCHER: 5413,
+  NW_HIDDEN_CARD: 5414, NW_MISSION_BOMBARD: 5415, SOA_TALISMAN_MASTERY: 5416, SOA_SOUL_MASTERY: 5417, SOA_TALISMAN_OF_PROTECTION: 5418, SOA_TALISMAN_OF_WARRIOR: 5419,
+  SOA_TALISMAN_OF_MAGICIAN: 5420, SOA_SOUL_GATHERING: 5421, SOA_TOTEM_OF_TUTELARY: 5422, SOA_TALISMAN_OF_FIVE_ELEMENTS: 5423, SOA_TALISMAN_OF_SOUL_STEALING: 5424, SOA_EXORCISM_OF_MALICIOUS_SOUL: 5425,
+  SOA_TALISMAN_OF_BLUE_DRAGON: 5426, SOA_TALISMAN_OF_WHITE_TIGER: 5427, SOA_TALISMAN_OF_RED_PHOENIX: 5428, SOA_TALISMAN_OF_BLACK_TORTOISE: 5429, SOA_TALISMAN_OF_FOUR_BEARING_GOD: 5430, SOA_CIRCLE_OF_DIRECTIONS_AND_ELEMENTALS: 5431,
+  SOA_SOUL_OF_HEAVEN_AND_EARTH: 5432, SH_MYSTICAL_CREATURE_MASTERY: 5433, SH_COMMUNE_WITH_CHUL_HO: 5434, SH_CHUL_HO_SONIC_CLAW: 5435, SH_HOWLING_OF_CHUL_HO: 5436, SH_HOGOGONG_STRIKE: 5437,
+  SH_COMMUNE_WITH_KI_SUL: 5438, SH_KI_SUL_WATER_SPRAYING: 5439, SH_MARINE_FESTIVAL_OF_KI_SUL: 5440, SH_SANDY_FESTIVAL_OF_KI_SUL: 5441, SH_KI_SUL_RAMPAGE: 5442, SH_COMMUNE_WITH_HYUN_ROK: 5443,
+  SH_COLORS_OF_HYUN_ROK: 5444, SH_HYUN_ROKS_BREEZE: 5445, SH_HYUN_ROK_CANNON: 5446, SH_TEMPORARY_COMMUNION: 5447, SH_BLESSING_OF_MYSTICAL_CREATURES: 5448, HN_SELFSTUDY_TATICS: 5449,
+  HN_SELFSTUDY_SOCERY: 5450, HN_DOUBLEBOWLINGBASH: 5451, HN_MEGA_SONIC_BLOW: 5452, HN_SHIELD_CHAIN_RUSH: 5453, HN_SPIRAL_PIERCE_MAX: 5454, HN_METEOR_STORM_BUSTER: 5455,
+  HN_JUPITEL_THUNDER_STORM: 5456, HN_JACK_FROST_NOVA: 5457, HN_HELLS_DRIVE: 5458, HN_GROUND_GRAVITATION: 5459, HN_NAPALM_VULCAN_STRIKE: 5460, HN_BREAKINGLIMIT: 5461,
+  HN_RULEBREAK: 5462, SKE_SKY_MASTERY: 5463, SKE_WAR_BOOK_MASTERY: 5464, SKE_RISING_SUN: 5465, SKE_NOON_BLAST: 5466, SKE_SUNSET_BLAST: 5467,
+  SKE_RISING_MOON: 5468, SKE_MIDNIGHT_KICK: 5469, SKE_DAWN_BREAK: 5470, SKE_TWINKLING_GALAXY: 5471, SKE_STAR_BURST: 5472, SKE_STAR_CANNON: 5473,
+  SKE_ALL_IN_THE_SKY: 5474, SKE_ENCHANTING_SKY: 5475, SS_TOKEDASU: 5476, SS_SHIMIRU: 5477, SS_AKUMUKESU: 5478, SS_SHINKIROU: 5479,
+  SS_KAGEGARI: 5480, SS_KAGENOMAI: 5481, SS_KAGEGISSEN: 5482, SS_FUUMASHOUAKU: 5483, SS_FUUMAKOUCHIKU: 5484, SS_KUNAIWAIKYOKU: 5485,
+  SS_KUNAIKAITEN: 5486, SS_KUNAIKUSSETSU: 5487, SS_SEKIENHOU: 5488, SS_REIKETSUHOU: 5489, SS_RAIDENPOU: 5490, SS_KINRYUUHOU: 5491,
+  SS_ANTENPOU: 5492, SS_KAGEAKUMU: 5493, SS_HITOUAKUMU: 5494, SS_ANKOKURYUUAKUMU: 5495, NW_THE_VIGILANTE_AT_NIGHT_GUN_GATLING: 5496, NW_THE_VIGILANTE_AT_NIGHT_GUN_SHOTGUN: 5497,
+  HN_OVERCOMING_CRISIS: 5505, SH_CHUL_HO_BATTERING: 5506, SH_HYUN_ROK_SPIRIT_POWER: 5507, DK_DRAGONIC_BREATH: 6001, MT_SPARK_BLASTER: 6002, MT_TRIPLE_LASER: 6003,
+  MT_MIGHTY_SMASH: 6004, BO_EXPLOSIVE_POWDER: 6005, BO_MAYHEMIC_THORNS: 6006, DK_DRAGONIC_PIERCE: 6502, IG_RADIANT_SPEAR: 6503, IG_IMPERIAL_CROSS: 6504,
+  IG_IMPERIAL_PRESSURE: 6505, MT_RUSH_STRIKE: 6506, MT_POWERFUL_SWING: 6507, MT_ENERGY_CANNONADE: 6508, BO_MYSTERY_POWDER: 6509, BO_DUST_EXPLOSION: 6510,
+  SHC_CROSS_SLASH: 6511, AG_ENERGY_CONVERSION: 6516, WH_WILD_WALK: 6520, HLIF_HEAL: 8001, HLIF_AVOID: 8002, HLIF_BRAIN: 8003,
+  HLIF_CHANGE: 8004, HAMI_CASTLE: 8005, HAMI_DEFENCE: 8006, HAMI_SKIN: 8007, HAMI_BLOODLUST: 8008, HFLI_MOON: 8009,
+  HFLI_FLEET: 8010, HFLI_SPEED: 8011, HFLI_SBR44: 8012, HVAN_CAPRICE: 8013, HVAN_CHAOTIC: 8014, HVAN_INSTRUCT: 8015,
+  HVAN_EXPLOSION: 8016, MH_SUMMON_LEGION: 8018, MH_NEEDLE_OF_PARALYZE: 8019, MH_POISON_MIST: 8020, MH_PAIN_KILLER: 8021, MH_LIGHT_OF_REGENE: 8022,
+  MH_OVERED_BOOST: 8023, MH_ERASER_CUTTER: 8024, MH_XENO_SLASHER: 8025, MH_SILENT_BREEZE: 8026, MH_STYLE_CHANGE: 8027, MH_SONIC_CRAW: 8028,
+  MH_SILVERVEIN_RUSH: 8029, MH_MIDNIGHT_FRENZY: 8030, MH_STAHL_HORN: 8031, MH_GOLDENE_FERSE: 8032, MH_STEINWAND: 8033, MH_HEILIGE_STANGE: 8034,
+  MH_ANGRIFFS_MODUS: 8035, MH_TINDER_BREAKER: 8036, MH_CBC: 8037, MH_EQC: 8038, MH_MAGMA_FLOW: 8039, MH_GRANITIC_ARMOR: 8040,
+  MH_LAVA_SLIDE: 8041, MH_PYROCLASTIC: 8042, MH_VOLCANIC_ASH: 8043, MH_BLAST_FORGE: 8044, MH_TEMPERING: 8045, MH_CLASSY_FLUTTER: 8046,
+  MH_TWISTER_CUTTER: 8047, MH_ABSOLUTE_ZEPHYR: 8048, MH_BRUSHUP_CLAW: 8049, MH_BLAZING_AND_FURIOUS: 8050, MH_THE_ONE_FIGHTER_RISES: 8051, MH_POLISHING_NEEDLE: 8052,
+  MH_TOXIN_OF_MANDARA: 8053, MH_NEEDLE_STINGER: 8054, MH_LICHT_GEHORN: 8055, MH_GLANZEN_SPIES: 8056, MH_HEILIGE_PFERD: 8057, MH_GOLDENE_TONE: 8058,
+  MH_BLAZING_LAVA: 8059, MS_BASH: 8201, MS_MAGNUM: 8202, MS_BOWLINGBASH: 8203, MS_PARRYING: 8204, MS_REFLECTSHIELD: 8205,
+  MS_BERSERK: 8206, MA_DOUBLE: 8207, MA_SHOWER: 8208, MA_SKIDTRAP: 8209, MA_LANDMINE: 8210, MA_SANDMAN: 8211,
+  MA_FREEZINGTRAP: 8212, MA_REMOVETRAP: 8213, MA_CHARGEARROW: 8214, MA_SHARPSHOOTING: 8215, ML_PIERCE: 8216, ML_BRANDISH: 8217,
+  ML_SPIRALPIERCE: 8218, ML_DEFENDER: 8219, ML_AUTOGUARD: 8220, ML_DEVOTION: 8221, MER_MAGNIFICAT: 8222, MER_QUICKEN: 8223,
+  MER_SIGHT: 8224, MER_CRASH: 8225, MER_REGAIN: 8226, MER_TENDER: 8227, MER_BENEDICTION: 8228, MER_RECUPERATE: 8229,
+  MER_MENTALCURE: 8230, MER_COMPRESS: 8231, MER_PROVOKE: 8232, MER_AUTOBERSERK: 8233, MER_DECAGI: 8234, MER_SCAPEGOAT: 8235,
+  MER_LEXDIVINA: 8236, MER_ESTIMATION: 8237, MER_KYRIE: 8238, MER_BLESSING: 8239, MER_INCAGI: 8240, MER_INVINCIBLEOFF2: 8241,
+  EL_CIRCLE_OF_FIRE: 8401, EL_FIRE_CLOAK: 8402, EL_FIRE_MANTLE: 8403, EL_WATER_SCREEN: 8404, EL_WATER_DROP: 8405, EL_WATER_BARRIER: 8406,
+  EL_WIND_STEP: 8407, EL_WIND_CURTAIN: 8408, EL_ZEPHYR: 8409, EL_SOLID_SKIN: 8410, EL_STONE_SHIELD: 8411, EL_POWER_OF_GAIA: 8412,
+  EL_PYROTECHNIC: 8413, EL_HEATER: 8414, EL_TROPIC: 8415, EL_AQUAPLAY: 8416, EL_COOLER: 8417, EL_CHILLY_AIR: 8418,
+  EL_GUST: 8419, EL_BLAST: 8420, EL_WILD_STORM: 8421, EL_PETROLOGY: 8422, EL_CURSED_SOIL: 8423, EL_UPHEAVAL: 8424,
+  EL_FIRE_ARROW: 8425, EL_FIRE_BOMB: 8426, EL_FIRE_BOMB_ATK: 8427, EL_FIRE_WAVE: 8428, EL_FIRE_WAVE_ATK: 8429, EL_ICE_NEEDLE: 8430,
+  EL_WATER_SCREW: 8431, EL_WATER_SCREW_ATK: 8432, EL_TIDAL_WEAPON: 8433, EL_WIND_SLASH: 8434, EL_HURRICANE: 8435, EL_HURRICANE_ATK: 8436,
+  EL_TYPOON_MIS: 8437, EL_TYPOON_MIS_ATK: 8438, EL_STONE_HAMMER: 8439, EL_ROCK_CRUSHER: 8440, EL_ROCK_CRUSHER_ATK: 8441, EL_STONE_RAIN: 8442,
+  EM_EL_FLAMETECHNIC: 8443, EM_EL_FLAMEARMOR: 8444, EM_EL_FLAMEROCK: 8445, EM_EL_COLD_FORCE: 8446, EM_EL_CRYSTAL_ARMOR: 8447, EM_EL_AGE_OF_ICE: 8448,
+  EM_EL_GRACE_BREEZE: 8449, EM_EL_EYES_OF_STORM: 8450, EM_EL_STORM_WIND: 8451, EM_EL_EARTH_CARE: 8452, EM_EL_STRONG_PROTECTION: 8453, EM_EL_AVALANCHE: 8454,
+  EM_EL_DEEP_POISONING: 8455, EM_EL_POISON_SHIELD: 8456, EM_EL_DEADLY_POISON: 8457, ABR_BATTLE_BUSTER: 8601, ABR_DUAL_CANNON_FIRE: 8602, ABR_NET_REPAIR: 8603,
+  ABR_NET_SUPPORT: 8604, ABR_INFINITY_BUSTER: 8605, GD_APPROVAL: 10000, GD_KAFRACONTRACT: 10001, GD_GUARDRESEARCH: 10002, GD_GUARDUP: 10003,
+  GD_EXTENSION: 10004, GD_GLORYGUILD: 10005, GD_LEADERSHIP: 10006, GD_GLORYWOUNDS: 10007, GD_SOULCOLD: 10008, GD_HAWKEYES: 10009,
+  GD_BATTLEORDER: 10010, GD_REGENERATION: 10011, GD_RESTORE: 10012, GD_EMERGENCYCALL: 10013, GD_DEVELOPMENT: 10014, GD_ITEMEMERGENCYCALL: 10015,
+  GD_GUILD_STORAGE: 10016, GD_CHARGESHOUT_FLAG: 10017, GD_CHARGESHOUT_BEATING: 10018, GD_EMERGENCY_MOVE: 10019
 };
 
 // Resolve a rAthena skill aegis name (MG_FIREBOLT) to the kRO numeric skill ID
@@ -908,22 +1361,46 @@ function effId(name) {
 function isSafeNumericLiteral(s) {
   const t = String(s || "").trim();
   if (!t) return false;
+  // The refine-aware emit path (emitBonusCallWithValue) substitutes the value
+  // arg with the "__VALUE__" sentinel before calling the translator, then swaps
+  // the real value back in. Treat it as valid so value-guarded translators
+  // (bResEff, bAddEff, …) still emit their call inside conditional/refine blocks
+  // instead of falling back to a description-only comment.
+  if (t === "__VALUE__") return true;
   // Allow plain integers and basic numeric expressions: digits, +-*/(), space.
   if (!/^[\d\s+\-*/().]+$/.test(t)) return false;
   if (!/\d/.test(t)) return false;
   return true;
 }
 
-// bonus bAddMaxWeight, V  →  AddMaxWeight(V) / SubMaxWeight(|V|)
-// Tooltip rendered by RDL custom Order entry [11] (in the bundled
-// EquipmentPropertiesOrder.template.lub stubs). Without this entry the
-// kRO client has no native "Max Weight" tooltip slot.
+// bonus bAddMaxWeight, V
+// When a "maxweight" probe entry is registered, route through the NATIVE
+// AddExtParam recorder using its spare ext-param id so the value can actually
+// render — matched by the injected "Max Weight" Order entry. With no probe
+// entry, fall back to the legacy AddMaxWeight/SubMaxWeight calls (which the
+// Project 255 client has no recorder for, so they don't display).
 BONUS_TRANSLATORS["baddmaxweight"] = (_n, a) => {
   if (a.length !== 1) return null;
   if (!isSafeNumericLiteral(a[0])) return null;
+  const probe = probeFor("maxweight");
+  if (probe) return emitProbeCall(probe, a[0]);
   const num = Number(a[0]);
-  if (Number.isFinite(num) && num < 0) return `SubMaxWeight(${Math.abs(num)})`;
-  return `AddMaxWeight(${a[0]})`;
+  const neg = Number.isFinite(num) && num < 0;
+  return neg ? `SubMaxWeight(${Math.abs(num)})` : `AddMaxWeight(${a[0]})`;
+};
+
+// bonus2 bResEff, Eff_X, V  →  status-effect resistance. V is in 1/100% units
+// (10000 = 100%). The client has no native status-resistance recorder, so we
+// rescue it through a per-effect probe ext-param id (display ÷100 via the Order
+// entry's valOpt) when one is registered; otherwise stay description-only.
+BONUS_TRANSLATORS["breseff"] = (_n, a) => {
+  if (a.length !== 2) return [];
+  const eff = effId(a[0]);
+  if (eff == null) return [];
+  if (!isSafeNumericLiteral(a[1])) return [];
+  const probe = probeFor("reseff:" + eff);
+  if (probe) return emitProbeCall(probe, a[1]);   // raw value; Order valOpt ÷100
+  return [];                                       // effect not registered → desc-only
 };
 
 // bonus2 bDropAddRace, Race, V%  →  AddReceiveItem_Equip(V)  (only for RC_All)
@@ -940,24 +1417,26 @@ BONUS_TRANSLATORS["bdropaddrace"] = (_n, a) => {
   return `AddReceiveItem_Equip(${a[1]})`;
 };
 
-// bonus3 bAutoSpell, Skill, Lv, Rate  →  AddAutoSpell(skill_id, lv, rate)
+// bonus3 bAutoSpell, Skill, Lv, Rate
+// Auto-cast skills are now surfaced as ONE COMBINED Order line per (item, mode),
+// wired by the pre-scan (registerItemAutospell) and emitted by
+// buildOnStartEquipBlock / formatCombiTableEntry as a single AddExtParam(0, id,
+// <count>) call. So the per-skill translator emits NO Lua call here — returning
+// [] avoids double-emitting (the combined line already covers every skill).
 BONUS_TRANSLATORS["bautospell"] = (_n, a) => {
-  if (a.length !== 3) return null;
-  const skill = /^\d+$/.test(a[0]) ? parseInt(a[0], 10) : resolveSkillId(a[0]);
-  if (skill == null) return null;
-  if (!isSafeNumericLiteral(a[1]) || !isSafeNumericLiteral(a[2])) return null;
-  return `AddAutoSpell(${skill}, ${a[1]}, ${a[2]})`;
+  if (a.length !== 3 && a.length !== 4) return null;   // bonus3 or bonus4 (4th = BF_* flag)
+  return [];
 };
-// bonus3 bAutoSpellWhenHit, Skill, Lv, Rate  →  AddAutoSpellWhenHit(...)
+// bonus3 bAutoSpellWhenHit, Skill, Lv, Rate — same per-item handling as bAutoSpell.
 BONUS_TRANSLATORS["bautospellwhenhit"] = (_n, a) => {
-  if (a.length !== 3) return null;
-  const skill = /^\d+$/.test(a[0]) ? parseInt(a[0], 10) : resolveSkillId(a[0]);
-  if (skill == null) return null;
-  if (!isSafeNumericLiteral(a[1]) || !isSafeNumericLiteral(a[2])) return null;
-  return `AddAutoSpellWhenHit(${skill}, ${a[1]}, ${a[2]})`;
+  if (a.length !== 3 && a.length !== 4) return null;   // bonus3 or bonus4 (4th = BF_* flag)
+  return [];
 };
 // bonus2 bAddEff, EffName, Rate(1/100%)  →  AddEffectOnAttack(eff_id, chance%)
-// Rate is in 1/100% units in rAthena, so divide by 100 for the call.
+// Rate is in 1/100% units in rAthena, so divide by 100 for the chance%.
+// `AddEffectOnAttack` has no native recorder on Project 255, so when a per-effect
+// probe id is registered we route the chance% through it instead (display ÷1,
+// matched by the injected "Chance to inflict … on attack" Order entry).
 BONUS_TRANSLATORS["baddeff"] = (_n, a) => {
   if (a.length !== 2) return null;
   const eff = effId(a[0]);
@@ -965,6 +1444,8 @@ BONUS_TRANSLATORS["baddeff"] = (_n, a) => {
   if (!isSafeNumericLiteral(a[1])) return null;
   const num = Number(a[1]);
   const chance = Number.isFinite(num) ? Math.round(num / 100) : a[1];
+  const probe = probeFor("addeff:" + eff);
+  if (probe) return emitProbeCall(probe, chance);
   return `AddEffectOnAttack(${eff}, ${chance})`;
 };
 
@@ -1649,8 +2130,10 @@ const JOB_NAME_TO_ID = {
   // Trans (4xxx) class IDs
   Job_Lord_Knight: 4008, Job_High_Priest: 4009, Job_High_Wizard: 4010,
   Job_Whitesmith: 4011, Job_Sniper: 4012, Job_Assassin_Cross: 4013,
-  Job_Paladin: 4014, Job_Champion: 4015, Job_Professor: 4016,
-  Job_Stalker: 4017, Job_Creator: 4018, Job_Clown: 4019, Job_Gypsy: 4020,
+  // Per client JobInfo/PCIds.lub: PALADIN=4015 (4014 is mounted Lord Knight,
+  // NOT Paladin); Champion..Gypsy are 4016..4021.
+  Job_Paladin: 4015, Job_Champion: 4016, Job_Professor: 4017,
+  Job_Stalker: 4018, Job_Creator: 4019, Job_Clown: 4020, Job_Gypsy: 4021,
   // 3rd jobs (4054+)
   Job_Rune_Knight: 4054, Job_Warlock: 4055, Job_Ranger: 4056,
   Job_Arch_Bishop: 4057, Job_Mechanic: 4058, Job_Guillotine_Cross: 4059,
@@ -1672,7 +2155,7 @@ const CLASS_TREE_DESCENDANTS = {
   Job_Knight:         [7, 13, 4008, 4014, 4030, 4036, 4054, 4060, 4066, 4073,
                        4080, 4081, 4082, 4083, 4088, 4089, 4090, 4091, 4092,
                        4093, 4094, 4095, 4096, 4102, 4109, 4110, 4252, 4265, 4280],
-  Job_Crusader:       [14, 4014, 4066, 4073, 4082, 4083, 4102, 4110],
+  Job_Crusader:       [14, 4015, 4022, 4066, 4073, 4082, 4083, 4102, 4110],
   Job_Lord_Knight:    [4008, 4014, 4054, 4060, 4080, 4081, 4088, 4089, 4090,
                        4091, 4092, 4093, 4094, 4095, 4096, 4109, 4252, 4265, 4280],
   Job_Rune_Knight:    [4054, 4060, 4080, 4081, 4088, 4089, 4090, 4091, 4092,
@@ -1696,12 +2179,15 @@ const CLASS_TREE_DESCENDANTS = {
 // listing specific IDs makes the conditional match advanced (Trans/3rd/4th)
 // classes whose base might differ across client builds.
 const BASE_CLASS_DESCENDANTS = {
-  1: [1, 7, 14, 4002, 4008, 4014, 4054, 4060, 4066, 4096, 4109, 4220, 4302], // Swordman line
-  2: [2, 9, 16, 4003, 4010, 4016, 4055, 4064, 4078, 4071, 4097, 4110, 4221], // Mage line
-  3: [3, 11, 19, 20, 4004, 4012, 4019, 4020, 4056, 4063, 4071, 4098, 4111],  // Archer line
-  4: [4, 8, 15, 4005, 4009, 4015, 4057, 4065, 4099, 4112, 4223],             // Acolyte line
-  5: [5, 10, 18, 4006, 4011, 4018, 4058, 4068, 4100, 4113, 4224],            // Merchant line
-  6: [6, 12, 17, 4007, 4013, 4017, 4059, 4072, 4101, 4114, 4225],            // Thief line
+  // 2nd-trans ids per client PCIds.lub: Paladin 4015 (Swordman), Champion 4016
+  // (Acolyte), Professor 4017 (Mage), Stalker 4018 (Thief), Creator 4019
+  // (Merchant), Clown 4020 + Gypsy 4021 (Archer). 4014/4022 are mounted LK/Paladin.
+  1: [1, 7, 14, 4002, 4008, 4014, 4015, 4022, 4054, 4060, 4066, 4096, 4109, 4220, 4302], // Swordman line (+Paladin 4015, +mounted Paladin 4022)
+  2: [2, 9, 16, 4003, 4010, 4017, 4055, 4064, 4078, 4071, 4097, 4110, 4221], // Mage line (Professor 4017)
+  3: [3, 11, 19, 20, 4004, 4012, 4020, 4021, 4056, 4063, 4071, 4098, 4111],  // Archer line (Clown 4020, Gypsy 4021)
+  4: [4, 8, 15, 4005, 4009, 4016, 4057, 4065, 4099, 4112, 4223],             // Acolyte line (Champion 4016)
+  5: [5, 10, 18, 4006, 4011, 4019, 4058, 4068, 4100, 4113, 4224],            // Merchant line (Creator 4019)
+  6: [6, 12, 17, 4007, 4013, 4018, 4059, 4072, 4101, 4114, 4225],            // Thief line (Stalker 4018)
 };
 
 // Translate an rAthena class-conditional expression into a client-Lua check
@@ -1772,9 +2258,49 @@ function balanced(s) {
   return d === 0;
 }
 
+// rAthena EQI_* equip-slot constant -> kRO equip-location bitmask. These are
+// the standard RO location bits (the same values GetLocation() returns and
+// GetRefineLevel() consumes), so `GetRefineLevel(<bitmask>)` reads the refine
+// of whatever item the character has in THAT slot — independent of which
+// OnStartEquip is running. That independence is exactly what a combo needs:
+// a combo's OnStartEquip has no single "current" slot, so GetLocation() (and
+// therefore a bare `r`) is meaningless there.
+// NOTE: if your client build numbers these locations differently, adjust here.
+const EQI_SLOT_LOCATION = {
+  EQI_HEAD_LOW:  1,
+  EQI_HAND_R:    2,    // weapon
+  EQI_GARMENT:   4,
+  EQI_ACC_L:     8,
+  EQI_ARMOR:     16,
+  EQI_HAND_L:    32,   // shield
+  EQI_SHOES:     64,
+  EQI_ACC_R:     128,
+  EQI_HEAD_TOP:  256,
+  EQI_HEAD_MID:  512,
+  EQI_COSTUME_HEAD_TOP: 1024,
+  EQI_COSTUME_HEAD_MID: 2048,
+  EQI_COSTUME_HEAD_LOW: 4096,
+  EQI_COSTUME_GARMENT:  8192,
+};
+
 function refineExprToLua(expr) {
   let s = String(expr || "").trim();
   while (/^\(.+\)$/.test(s) && balanced(s.slice(1, -1))) s = s.slice(1, -1).trim();
+  // A SLOT-QUALIFIED refine read — getequiprefinerycnt(EQI_X) / getequiprefine(EQI_X)
+  // — means "the refine of the piece in slot X", which may be a DIFFERENT item
+  // than the one carrying the bonus (the norm for combos). Emit an explicit
+  // per-slot GetRefineLevel(<bitmask>) so each distinct slot keeps its own
+  // value (e.g. 2 - shield_refine - headgear_refine) instead of collapsing
+  // every call to the same `r`. An unrecognised slot falls through to `r`.
+  s = s.replace(/\b(?:getequiprefinerycnt|getequiprefine)\s*\(\s*([A-Za-z_]\w*)\s*\)/gi,
+    (_m, slot) => {
+      const loc = EQI_SLOT_LOCATION[slot.toUpperCase()];
+      return loc !== undefined ? `GetRefineLevel(${loc})` : "r";
+    });
+  // Remaining bare getrefine() (and any slot we couldn't resolve) -> the
+  // current item's refine, read via the `local r = GetRefineLevel(GetLocation())`
+  // prelude. Valid in a single item's OnStartEquip; in a combo a bare
+  // getrefine() is inherently ambiguous and stays best-effort.
   s = s.replace(REFINE_CALL_RE_G, "r");
   // Lua exponentiation is `^`, not `**` (rAthena/Hercules scripts use `**`).
   s = s.replace(/\*\*/g, "^");
@@ -1914,17 +2440,20 @@ function friendlyStatusEffect(raw) {
 function describeNonBonusCommand(raw) {
   const text = String(raw || "").trim().replace(/;\s*$/, "");
 
-  // skill SkillName, Lv;  → kRO `EnableSkill(<skill_id>, <lv>)` + description.
-  // Matches the stock FreyjaRO format for skill-grant cards (e.g. Marine
-  // Sphere → `EnableSkill(7, 3)`). If we can't resolve the aegis to a
-  // numeric ID we skip the call (still emit the description so the player
-  // at least sees what the card is supposed to do).
-  let m = /^skill\s+([A-Za-z_]\w*)\s*,\s*(\d+)\b/i.exec(text);
+  // skill <SkillName|SkillId>, Lv;  → kRO `EnableSkill(<skill_id>, <lv>)` + desc.
+  // Accepts a numeric skill id (`skill 1013,1`), a bare aegis name
+  // (`skill MG_FIREBOLT,1`), or a QUOTED aegis name (`skill "WZ_WATERBALL",1`)
+  // — rAthena emits any of these forms. Matches the stock FreyjaRO format for
+  // skill-grant cards (e.g. Marine Sphere → `EnableSkill(7, 3)`). For a numeric
+  // id we use it directly; for an aegis we resolve via the skill DB, falling
+  // back to BUILTIN_SKILL_IDS. If we can't resolve an aegis we skip the call
+  // but still emit the description.
+  let m = /^skill\s+"?(\d+|[A-Za-z_]\w*)"?\s*,\s*(\d+)\b/i.exec(text);
   if (m) {
-    const aegis = m[1];
+    const skillTok = m[1];
     const lv = m[2];
-    const skillId = resolveSkillId(aegis);
-    const desc = `-- Enable to use Level ${lv} of ${friendlySkill(aegis)}`;
+    const skillId = /^\d+$/.test(skillTok) ? parseInt(skillTok, 10) : resolveSkillId(skillTok);
+    const desc = `-- Enable to use Level ${lv} of ${friendlySkill(skillTok)}`;
     if (skillId != null) return [`EnableSkill(${skillId}, ${lv})`, desc];
     return [desc];
   }
@@ -2366,7 +2895,6 @@ function translateScriptRefineAware(script) {
 
   const out = [];
   const emittedAccBase = new Set();
-  let usesR = false;
 
   for (const name of accUsed) {
     if (!accHasExplicitAssign.has(name)) {
@@ -2425,7 +2953,6 @@ function translateScriptRefineAware(script) {
           if (c1 && c2) {
             const desc = formatBonusDescription(s.bname, s.args);
             if (desc) out.push(indent + `-- ${desc} (varies with refine)`);
-            usesR = true;
             out.push(indent + `if r ${cmp} ${threshold} then`);
             for (const c of c1) out.push(indent + "  " + c);
             out.push(indent + `else`);
@@ -2464,7 +2991,6 @@ function translateScriptRefineAware(script) {
     if (calls == null) { descFallback(); return; }
     const desc = formatBonusDescription(s.bname, s.args);
     if (desc) out.push(indent + `-- ${desc}${scalar.usesR ? " (scales with refine)" : ""}`);
-    if (scalar.usesR) usesR = true;
     // exprToLua() passes server-only calls (getequipid, JobLevel, …) through
     // verbatim; emitting them would crash the client at equip time, and the
     // line sanitizer would otherwise turn them into a redundant "-- TODO unsafe
@@ -2571,7 +3097,6 @@ function translateScriptRefineAware(script) {
     const captured = out.splice(start);
     const realCalls = captured.filter(l => l.trim() && !l.trim().startsWith("--"));
     if (captured.length === 0) return;
-    usesR = true;
     if (captured.length === 1 && realCalls.length === 1) {
       out.push(indent + `if r ${cmp} ${threshold} then ${captured[0].trim()} end`);
     } else {
@@ -2628,7 +3153,13 @@ function translateScriptRefineAware(script) {
     if (l.trim().startsWith("--")) return false;
     return /(^|[^A-Za-z0-9_])r([^A-Za-z0-9_]|$)/.test(l);
   });
-  if (hasNativeCall && (usesR || referencesR)) {
+  // Only prepend the `local r` prelude when the emitted body actually
+  // references a bare `r` (the current-item refine). Slot-qualified reads emit
+  // GetRefineLevel(<bitmask>) inline and need no prelude — important for combos,
+  // where GetLocation() is meaningless. `referencesR` is computed from the real
+  // output, so it's authoritative; idents never collide with `r` (sanitizeIdent
+  // remaps "r" -> "value", and accumulators use a..f).
+  if (hasNativeCall && referencesR) {
     out.unshift("local r = GetRefineLevel(GetLocation())");
   }
   if (!hasNativeCall) {
@@ -3012,9 +3543,15 @@ function buildOnStartEquipBlock(item) {
   const ownScript = collectScriptText(item);
   const ownBody = ownScript ? dedupeConsecutiveComments(translateScript(ownScript)) : [];
 
-  if (!ownBody.length) return null;
+  // Combined per-(item, mode) auto-cast lines: ONE AddExtParam(0, id, <count>)
+  // per mode, wired by the Apply pre-scan (registerItemAutospell). The per-skill
+  // translators emit nothing, so these are the only auto-cast calls. Fold them in
+  // BEFORE the empty-body check so an item whose ONLY effects are auto-casts still
+  // produces an OnStartEquip block instead of being dropped.
+  const autoCalls = autospellCallsFor(String(item.Id));
+  const body = ownBody.concat(autoCalls);
 
-  const body = ownBody.slice();
+  if (!body.length) return null;
 
   // If every translated line is a `-- comment` (no AddExtParam/Add* call),
   // skip the OnStartEquip wrapper. The kRO client's bonus scanner counts the
@@ -3232,6 +3769,9 @@ function formatCombiTableEntry(setId, partnerIds, script, indent) {
   const body = (script && script.trim())
     ? translateScript(script).filter(l => l.trim())
     : [];
+  // Append this combo's combined auto-cast line(s) — ONE AddExtParam(0, id,
+  // <count>) per mode, wired by the pre-scan under key "combo<setId>".
+  for (const c of autospellCallsFor("combo" + setId)) body.push(c);
   const hasRealCall = body.some(l => !l.trim().startsWith("--"));
   if (hasRealCall) {
     // Real Lua calls → wrap in an OnStartEquip function at field depth, with
@@ -3777,15 +4317,16 @@ const RDL_ORDER_STUB_BLOCK = `
 -- ============================================================
 --   RDL custom stubs for AutoSpell / AddEff / MaxWeight tooltip support
 -- ------------------------------------------------------------
--- Emitted by EquipmentProperties.lub for bonuses that have no native
--- kRO tooltip handler. We stub them as no-ops and let the Order entries
--- [7]-[11] below render the descriptive text.
+-- Each definition is GUARDED with an "if type(...) ~= function" check so a
+-- client that has a native tooltip recorder keeps it (value renders); only a
+-- client lacking it gets a no-op (prevents a crash). Defining them
+-- unconditionally would shadow a native recorder and stop the value showing.
 -- ============================================================
-function AddAutoSpell(skill_id, level, chance) end
-function AddAutoSpellWhenHit(skill_id, level, chance) end
-function AddEffectOnAttack(effect_id, chance) end
-function AddMaxWeight(amount) end
-function SubMaxWeight(amount) end
+if type(AddAutoSpell) ~= "function" then function AddAutoSpell(skill_id, level, chance) end end
+if type(AddAutoSpellWhenHit) ~= "function" then function AddAutoSpellWhenHit(skill_id, level, chance) end end
+if type(AddEffectOnAttack) ~= "function" then function AddEffectOnAttack(effect_id, chance) end end
+if type(AddMaxWeight) ~= "function" then function AddMaxWeight(amount) end end
+if type(SubMaxWeight) ~= "function" then function SubMaxWeight(amount) end end
 if type(GetEffectName) ~= "function" then
   local EFF_NAMES = {
     [1]="Stun",[2]="Frozen",[3]="Stone",[4]="Sleep",[5]="Poisoned",
@@ -3835,6 +4376,244 @@ const RDL_ORDER_ENTRIES = `,
 \t\t\t\tsym = SymbolPreset.IncSign
 \t\t\t}`;
 
+// ============================================================================
+//   Custom-bonus → Order entry generation
+// ----------------------------------------------------------------------------
+// When the user defines a Custom Bonus (Custom Bonuses modal → custom_bonuses.json)
+// its Lua template (e.g. `IncreasePogi({arg1})`) is emitted into
+// EquipmentProperties.lub, but the kRO tooltip renderer only displays a
+// recorded function call if EquipmentPropertiesOrder.lub has a matching Order
+// entry. These helpers auto-derive one Order entry per custom bonus so the
+// value the item registers actually shows up in the tooltip:
+//
+//   func  = the function name parsed from the Lua template
+//   val   = the 1-based position of the {arg1} value placeholder in the call
+//   name  = the Description, with {arg1} → {sym}{val} (keeps a trailing %),
+//           rendered with SymbolPreset.IncSign so +/- both display correctly
+//
+// A no-op stub `function <fn>(...) end` is also emitted (mirroring the RDL
+// AutoSpell stubs) so the property function doesn't crash on a client that
+// has no native handler. Entries/stubs are wrapped in BEGIN/END markers and
+// stripped-then-regenerated on every run, so re-applying is idempotent and
+// never produces duplicate keys (which trip the kRO "invalid uniq2" check).
+// ============================================================================
+const RDL_CB_ENTRIES_BEGIN = "-- RDL custom-bonus entries BEGIN (auto-generated from custom_bonuses.json)";
+const RDL_CB_ENTRIES_END   = "-- RDL custom-bonus entries END";
+const RDL_CB_STUBS_BEGIN   = "-- RDL custom-bonus stubs BEGIN (auto-generated from custom_bonuses.json)";
+const RDL_CB_STUBS_END     = "-- RDL custom-bonus stubs END";
+const RDL_PROBE_BEGIN      = "-- RDL probe entry BEGIN (Max Weight via spare ext-param id)";
+const RDL_PROBE_END        = "-- RDL probe entry END";
+
+function escapeRegExpLocal(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function luaEscape(s) {
+  return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+// Parse a single-call Lua template like `IncreasePogi({arg1})` into
+// { fn, valIdx } where valIdx is the 1-based position of the {arg1} value
+// placeholder in the call's argument list. Returns null for anything that
+// isn't a single function call carrying an {arg1} value arg (multi-line
+// templates, raw Lua, or value-less flags are skipped).
+function parseCustomBonusCall(lua) {
+  if (!lua) return null;
+  const oneLine = lua.trim();
+  if (/[\r\n]/.test(oneLine)) return null;
+  const m = /^([A-Za-z_]\w*)\s*\(([\s\S]*)\)\s*;?$/.exec(oneLine);
+  if (!m) return null;
+  const fn = m[1];
+  const argList = m[2].trim() === "" ? [] : m[2].split(",").map(s => s.trim());
+  let valIdx = -1;
+  for (let i = 0; i < argList.length; i++) {
+    if (argList[i] === "{arg1}") { valIdx = i + 1; break; }
+  }
+  if (valIdx < 0) return null;
+  return { fn, valIdx };
+}
+
+// Build the Order `name` template from a custom bonus's Description.
+//   "Increase Pogi {arg1}%"  →  "Increase Pogi {sym}{val}%"
+// Falls back to the "{sym}{val}#Label" convention when the Description has no
+// {arg1} placeholder (or no Description at all).
+function customBonusOrderName(rule) {
+  const desc = (rule.description || "").trim();
+  if (desc.includes("{arg1}")) {
+    let name = desc.replace(/\{arg1\}(%?)/, (_, pct) => "{sym}{val}" + pct);
+    // Any other {argN} can't be resolved at tooltip-render time — drop them.
+    name = name.replace(/\{arg\d+\}/g, "").replace(/\s{2,}/g, " ").trim();
+    return name;
+  }
+  return "{sym}{val}#" + (desc || rule.name || "Custom");
+}
+
+// Inspect CUSTOM_BONUSES against the current Order text and return the
+// renderable entries + the function names that need stubs. Skips rules whose
+// function already has an Order entry (built-in or RDL) so we never duplicate
+// a render rule. Returns { entries:[{fn,valIdx,name}], stubFns:[fn], skipped:[reason] }.
+function buildCustomOrderArtifacts(existingText) {
+  const entries = [];
+  const stubFns = [];
+  const skipped = [];
+  const seenFns = new Set();
+  for (const rule of CUSTOM_BONUSES) {
+    const call = parseCustomBonusCall(rule.lua);
+    if (!call) { skipped.push(`${rule.name} (Lua is not a single {arg1} call)`); continue; }
+    if (seenFns.has(call.fn)) { continue; }
+    // Skip any function whose name already appears as a quoted string in the
+    // Order file — native functions show up in FunctionPreset/func tables, and
+    // re-declaring them (or stubbing them as no-ops) would break the built-in
+    // render rules and trip the kRO "invalid uniq2" validator.
+    const fnRe = new RegExp('"' + escapeRegExpLocal(call.fn) + '"');
+    if (fnRe.test(existingText)) { skipped.push(`${rule.name} (${call.fn} already has an Order entry)`); continue; }
+    seenFns.add(call.fn);
+    entries.push({ fn: call.fn, valIdx: call.valIdx, name: luaEscape(customBonusOrderName(rule)) });
+    stubFns.push(call.fn);
+  }
+  return { entries, stubFns, skipped };
+}
+
+// One custom-bonus Order entry body at the given index (no trailing comma).
+function renderCustomEntry(idx, e) {
+  return (
+    `\t\t\t[${idx}] = {\n` +
+    `\t\t\t\tname = "${e.name}",\n` +
+    `\t\t\t\tfunc = { "${e.fn}" },\n` +
+    `\t\t\t\tval = { [${e.valIdx}] = Operation.ADD },\n` +
+    `\t\t\t\tsym = SymbolPreset.IncSign\n` +
+    `\t\t\t}`
+  );
+}
+
+// One probe Order entry body (no trailing comma). Routes a value through the
+// native AddExtParam recorder via a spare ext-param id, so it renders even
+// though the client has no native recorder for the original effect. `entry` is
+// a PROBE_ENTRIES element; `entry.div` (when > 1) divides the raw value for
+// display via valOpt.
+function renderProbeEntry(idx, entry) {
+  const valOpt = (entry.div && entry.div !== 1)
+    ? `,\n\t\t\t\tvalOpt = { [ValueOption.DIV] = ${entry.div}, [ValueOption.FLOAT] = 0 }`
+    : "";
+  return (
+    `\t\t\t[${idx}] = {\n` +
+    `\t\t\t\tname = "${entry.name}",\n` +
+    `\t\t\t\tfunc = FunctionPreset.IncStat,\n` +
+    `\t\t\t\tval = ValuePreset.ExtParam,\n` +
+    `\t\t\t\tcond = { [1] = 0, [2] = ${entry.extParamId} },\n` +
+    `\t\t\t\tsym = SymbolPreset.IncSign${valOpt}\n` +
+    `\t\t\t}`
+  );
+}
+
+function renderCustomStubBlock(stubFns) {
+  if (!stubFns.length) return "";
+  // Guard each stub: if the client already provides a native recorder for this
+  // function, keep it (so the value renders); only define a no-op when it's
+  // missing (prevents a crash). Defining unconditionally would shadow a native
+  // recorder with a no-op and stop the value displaying.
+  const body = stubFns
+    .map(fn => `if type(${fn}) ~= "function" then function ${fn}(...) end end`)
+    .join("\n");
+  return `\n${RDL_CB_STUBS_BEGIN}\n${body}\n${RDL_CB_STUBS_END}\n`;
+}
+
+function stripCustomOrderBlock(text) {
+  let t = text.replace(
+    new RegExp(",?\\s*" + escapeRegExpLocal(RDL_CB_ENTRIES_BEGIN) + "[\\s\\S]*?" + escapeRegExpLocal(RDL_CB_ENTRIES_END), "m"),
+    ""
+  );
+  t = t.replace(
+    new RegExp("\\s*" + escapeRegExpLocal(RDL_CB_STUBS_BEGIN) + "[\\s\\S]*?" + escapeRegExpLocal(RDL_CB_STUBS_END) + "\\n?", "m"),
+    ""
+  );
+  return t;
+}
+
+function stripProbeBlock(text) {
+  return text.replace(
+    new RegExp(",?\\s*" + escapeRegExpLocal(RDL_PROBE_BEGIN) + "[\\s\\S]*?" + escapeRegExpLocal(RDL_PROBE_END), "m"),
+    ""
+  );
+}
+
+// Inject every registered probe Order entry into the "Special" tab (top-level
+// Special section's order table), at the next contiguous indices. Idempotent:
+// strips any prior probe block first (all entries live in ONE BEGIN/END wrapper,
+// so the single non-global strip regex clears them in one pass). Returns
+// { text, added }. No-op when no probes are registered or the Special section
+// can't be located.
+function injectMaxWeightProbe(text) {
+  const cleaned = stripProbeBlock(text);
+  // Static probes + per-run dynamic auto-cast probes, all in one wrapper block.
+  const entries = [...PROBE_ENTRIES, ...dynamicProbes.values()].filter(e => e.extParamId != null);
+  if (!entries.length) return { text: cleaned, added: 0 };
+
+  // Locate the "Special" section header.
+  const sp = cleaned.search(/name\s*=\s*"Special"/);
+  if (sp < 0) return { text: cleaned, added: 0 };
+  // The Special section's order table closes at the first 2-tab `}` followed by
+  // a 1-tab section close. Section entries close at 3 tabs, so this is unique.
+  // CRLF-tolerant (these .lub files use \r\n line endings).
+  const closeRel = cleaned.slice(sp).search(/\r?\n\t\t\}\r?\n\t\}/);
+  if (closeRel < 0) return { text: cleaned, added: 0 };
+  const closePos = sp + closeRel; // index just before the order-close line
+
+  // Next contiguous index = max existing [N] in the Special order + 1; each
+  // probe entry gets its own sequential index (distinct ids never share a slot).
+  const slice = cleaned.slice(sp, closePos);
+  let lastN = 0, m;
+  const re = /\n\t\t\t\[(\d+)\]\s*=\s*\{/g;
+  while ((m = re.exec(slice)) !== null) {
+    const n = parseInt(m[1], 10);
+    if (n > lastN) lastN = n;
+  }
+
+  const bodies = entries.map((e, i) => renderProbeEntry(lastN + 1 + i, e));
+  const block =
+    `,\n\t\t\t${RDL_PROBE_BEGIN}\n` +
+    bodies.join(",\n") +
+    `\n\t\t\t${RDL_PROBE_END}`;
+  const out = cleaned.slice(0, closePos) + block + cleaned.slice(closePos);
+  return { text: out, added: entries.length };
+}
+
+// Layer the auto-generated custom-bonus stubs + Order entries onto an
+// already-RDL-patched Order file. Idempotent: strips any prior custom block
+// first, then regenerates. Returns { text, added, skipped }.
+function injectCustomBonusOrder(text) {
+  const cleaned = stripCustomOrderBlock(text);
+  const { entries, stubFns, skipped } = buildCustomOrderArtifacts(cleaned);
+  if (!entries.length) return { text: cleaned, added: 0, skipped };
+
+  // Anchor the entries after the RDL [11] AddMaxWeight entry (inside the
+  // section's order table, alongside the other RDL entries).
+  const anchor = /(func\s*=\s*\{\s*"AddMaxWeight"[^}]*\}[\s\S]*?\n[ \t]*\})/;
+  if (!anchor.test(cleaned)) {
+    return { text: cleaned, added: 0, skipped: skipped.concat(["AddMaxWeight anchor not found — Order file uses a different layout"]) };
+  }
+
+  let out = cleaned;
+  const stubBlock = renderCustomStubBlock(stubFns);
+  if (stubBlock) {
+    const enumMarker = "EnumVAR = EnumVAR or {}";
+    if (out.includes(enumMarker)) out = out.replace(enumMarker, enumMarker + stubBlock);
+    else out = stubBlock + out;
+  }
+
+  const bodies = entries.map((e, i) => renderCustomEntry(12 + i, e));
+  const block = `,\n\t\t\t${RDL_CB_ENTRIES_BEGIN}\n${bodies.join(",\n")}\n\t\t\t${RDL_CB_ENTRIES_END}`;
+  out = out.replace(anchor, "$1" + block);
+  return { text: out, added: bodies.length, skipped };
+}
+
+// Apply all dynamic Order-file injections (Max Weight probe → Special tab, then
+// custom-bonus entries → Skill section). Returns { text, added, skipped }.
+function injectDynamicOrderEntries(text) {
+  const probe = injectMaxWeightProbe(text);
+  const cb = injectCustomBonusOrder(probe.text);
+  return { text: cb.text, added: probe.added + cb.added, skipped: cb.skipped };
+}
+
 // Write a fresh EquipmentPropertiesOrder.lub from the bundled template
 // alongside the source .lub. The template ships pre-patched with the RDL
 // custom Order entries [7]-[10] + stub Lua functions, so the kRO tooltip
@@ -3871,11 +4650,20 @@ async function writeOrderFromTemplate(srcLubPath, logFn) {
     return { written: false };
   }
 
+  // Layer the dynamic Order entries (Max Weight probe + custom bonuses) onto
+  // the template so those values render in the tooltip.
+  const cb = injectDynamicOrderEntries(templateText);
+  const finalText = cb.text;
+  if (typeof logFn === "function") {
+    if (cb.added) logFn(`Order.lub: added ${cb.added} dynamic Order entr${cb.added === 1 ? "y" : "ies"} (Max Weight probe / custom bonuses).`);
+    for (const s of cb.skipped) logFn(`Order.lub: skipped custom bonus — ${s}`);
+  }
+
   // Compare to existing — if identical, skip (no need to bump mtime).
   try {
     const existing = await Neutralino.filesystem.readFile(destPath);
-    if (existing === templateText) {
-      if (typeof logFn === "function") logFn(`Order.lub: already matches bundled template (${templateText.length} bytes).`);
+    if (existing === finalText) {
+      if (typeof logFn === "function") logFn(`Order.lub: already matches bundled template (${finalText.length} bytes).`);
       return { written: false, unchanged: true };
     }
     // Backup before overwrite.
@@ -3883,9 +4671,9 @@ async function writeOrderFromTemplate(srcLubPath, logFn) {
   } catch {
     // Destination doesn't exist — that's fine, we'll create it.
   }
-  await Neutralino.filesystem.writeFile(destPath, templateText);
+  await Neutralino.filesystem.writeFile(destPath, finalText);
   if (typeof logFn === "function") {
-    logFn(`Order.lub: wrote bundled template (${templateText.length} bytes) to ${destPath}`);
+    logFn(`Order.lub: wrote bundled template (${finalText.length} bytes) to ${destPath}`);
   }
   return { written: true, destPath };
 }
@@ -3911,53 +4699,77 @@ async function patchOrderFiles(srcLubPath, logFn) {
     .filter(e => e.type === "FILE" && /^EquipmentPropertiesOrder\d*\.lub$/i.test(e.entry))
     .map(e => dir + sep + e.entry);
 
+  const cbSkipped = [];
+  const cbSkippedSeen = new Set();
   for (const path of candidates) {
     try {
       const text = await Neutralino.filesystem.readFile(path);
-      // Already patched AND has the latest entry [11] AddMaxWeight stub?
-      // Skip. If [11] is missing (old v1 patch), fall through to re-patch
-      // so the user gets the new tooltip render rules.
-      if (text.includes(RDL_ORDER_MARKER) && /func\s*=\s*\{\s*"AddMaxWeight"/.test(text)) {
-        result.skipped.push(path);
-        continue;
-      }
-      // Old-version patch detected — strip the previous RDL block first so
-      // we don't end up with duplicate entries (which the kRO validator
-      // rejects with "invalid 'uniq2' field").
-      let strippedText = text;
-      if (text.includes(RDL_ORDER_MARKER)) {
-        // Drop the stub block and the entries [7]..[N]
-        strippedText = strippedText.replace(
-          /\s*-- =+\s*\n--\s+RDL custom stubs[\s\S]*?-- =+\s*\nfunction AddAutoSpell[\s\S]*?\nend\s*\n(?:end\s*\n)?/m,
-          ""
-        );
-        strippedText = strippedText.replace(
-          /,\s*\n\s*-- RDL custom: skill grant[\s\S]*?\}\s*(?=\n\s*\}\s*\n\s*\},)/m,
-          ""
-        );
-      }
-      // Step 1: inject stub block after `EnumVAR = EnumVAR or {}` (or at
-      // the very top if no such line exists). Use the strippedText so we
-      // don't double-up on an existing (older) RDL block.
-      let patched = strippedText;
-      const enumMarker = "EnumVAR = EnumVAR or {}";
-      if (patched.includes(enumMarker)) {
-        patched = patched.replace(enumMarker, enumMarker + RDL_ORDER_STUB_BLOCK);
+
+      // Step A: make sure the RDL [7]-[11] entries + guarded stubs are present.
+      // "Current" means: marked, has the AddMaxWeight entry, AND uses the
+      // guarded `if type(...)` stub form. Files patched by an older version
+      // (unconditional stubs that shadow native recorders) fall through to be
+      // stripped and re-patched with the guarded form.
+      let rdlText;
+      const hasMarker      = text.includes(RDL_ORDER_MARKER);
+      const hasMaxWeight   = /func\s*=\s*\{\s*"AddMaxWeight"/.test(text);
+      const hasGuardedStub = /if type\(AddMaxWeight\)\s*~=\s*"function"/.test(text);
+      if (hasMarker && hasMaxWeight && hasGuardedStub) {
+        // Already RDL-patched and current — keep as-is; the custom-bonus
+        // entries are still refreshed in Step B below.
+        rdlText = text;
       } else {
-        patched = RDL_ORDER_STUB_BLOCK + "\n" + patched;
+        // Old-version patch detected — strip the previous RDL block first so
+        // we don't end up with duplicate entries (which the kRO validator
+        // rejects with "invalid 'uniq2' field").
+        let strippedText = text;
+        if (text.includes(RDL_ORDER_MARKER)) {
+          // Drop the stub block and the entries [7]..[N]
+          strippedText = strippedText.replace(
+            /\s*-- =+\s*\n--\s+RDL custom stubs[\s\S]*?-- =+\s*\nfunction AddAutoSpell[\s\S]*?\nend\s*\n(?:end\s*\n)?/m,
+            ""
+          );
+          strippedText = strippedText.replace(
+            /,\s*\n\s*-- RDL custom: skill grant[\s\S]*?\}\s*(?=\n\s*\}\s*\n\s*\},)/m,
+            ""
+          );
+        }
+        // Step 1: inject stub block after `EnumVAR = EnumVAR or {}` (or at
+        // the very top if no such line exists). Use the strippedText so we
+        // don't double-up on an existing (older) RDL block.
+        let patched = strippedText;
+        const enumMarker = "EnumVAR = EnumVAR or {}";
+        if (patched.includes(enumMarker)) {
+          patched = patched.replace(enumMarker, enumMarker + RDL_ORDER_STUB_BLOCK);
+        } else {
+          patched = RDL_ORDER_STUB_BLOCK + "\n" + patched;
+        }
+        // Step 2: inject Order entries after the AddDamage_SKID entry in
+        // section [6] (Skill). Match the closing `}` of that entry, optionally
+        // followed by a "Removed [7]" comment block.
+        const orderPattern = /(sep\s*=\s*\{\s*\[2\]\s*=\s*"GetAddDamageSkillName"\s*\}\s*\})(\s*--\s*Removed\s*\[7\][^\n]*\n\s*--[^\n]*)?/;
+        if (!orderPattern.test(patched)) {
+          result.errors.push({ path, msg: "AddDamage_SKID anchor not found — Order file may use a different layout." });
+          continue;
+        }
+        rdlText = patched.replace(orderPattern, "$1" + RDL_ORDER_ENTRIES);
       }
-      // Step 2: inject Order entries after the AddDamage_SKID entry in
-      // section [6] (Skill). Match the closing `}` of that entry, optionally
-      // followed by a "Removed [7]" comment block.
-      const orderPattern = /(sep\s*=\s*\{\s*\[2\]\s*=\s*"GetAddDamageSkillName"\s*\}\s*\})(\s*--\s*Removed\s*\[7\][^\n]*\n\s*--[^\n]*)?/;
-      if (orderPattern.test(patched)) {
-        patched = patched.replace(orderPattern, "$1" + RDL_ORDER_ENTRIES);
-        // Write a backup + the new content.
+
+      // Step B: layer the dynamic entries on top (Max Weight probe → Special
+      // tab, custom-bonus entries → Skill section).
+      const cb = injectDynamicOrderEntries(rdlText);
+      for (const s of cb.skipped) {
+        if (!cbSkippedSeen.has(s)) { cbSkippedSeen.add(s); cbSkipped.push(s); }
+      }
+      const finalText = cb.text;
+
+      // Only touch the file if the end result differs from what's on disk.
+      if (finalText !== text) {
         await Neutralino.filesystem.writeFile(path + ".pre-rdl-custom.bak", text);
-        await Neutralino.filesystem.writeFile(path, patched);
+        await Neutralino.filesystem.writeFile(path, finalText);
         result.patched.push(path);
       } else {
-        result.errors.push({ path, msg: "AddDamage_SKID anchor not found — Order file may use a different layout." });
+        result.skipped.push(path);
       }
     } catch (e) {
       result.errors.push({ path, msg: String(e.message || e) });
@@ -3972,6 +4784,9 @@ async function patchOrderFiles(srcLubPath, logFn) {
     }
     if (result.skipped.length) {
       logFn(`Order files: ${result.skipped.length} already up-to-date.`);
+    }
+    for (const s of cbSkipped) {
+      logFn(`Order files: skipped custom bonus — ${s}`);
     }
     if (result.errors.length) {
       for (const err of result.errors) {
@@ -4643,6 +5458,28 @@ document.getElementById("run").onclick = async () => {
       for (const id of existing.usedIds) validSetIds.add(id);
     } catch {}
     for (const e of pendingCombiEntries) validSetIds.add(e.setId);
+
+    // Pre-scan every item/combo script for auto-cast skills and allocate ONE
+    // probe ext-param id per (ITEM, MODE) BEFORE the Order file is written — so
+    // the injected Order entries and the OnStartEquip calls agree on ids. One
+    // combined line per item+mode (lists every auto-cast skill) keeps id demand
+    // low on the limited-id Project 255 client.
+    resetDynamicProbes();
+    // Scan the rAthena ITEM scripts (where bAutoSpell lives) — NOT sourceText,
+    // which is the kRO .lub being patched and has no rAthena bonus lines.
+    const autoMap = [];
+    for (const it of body) autoMap.push(...registerItemAutospell(String(it.Id), collectScriptText(it)));
+    for (const e of pendingCombiEntries) autoMap.push(...registerItemAutospell("combo" + e.setId, e && e.script));
+    if (autoMap.length) {
+      const wired = autoMap.filter(a => a.extParamId != null).length;
+      log(`Auto-cast lines: ${wired} wired (one combined line per item+mode).`);
+      for (const a of autoMap) {
+        const where = a.mode === "hit" ? "when hit" : "on attack";
+        const label = `${a.itemKey} (${where}, ${a.count} effect${a.count === 1 ? "" : "s"}): ${a.skills}`;
+        if (a.extParamId != null) log(`  ${label} → ext-param ${a.extParamId} (verify it renders in-client)`);
+        else log(`  ${label} → POOL EXHAUSTED — won't display; extend AUTOSPELL_PROBE_ID_POOL`);
+      }
+    }
 
     // Write a fresh EquipmentPropertiesOrder.lub from the bundled template.
     // The template ships pre-patched with RDL custom Order entries, so this
